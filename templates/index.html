@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tactical Pan Studio</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">Local video workspace</p>
+          <h1>Tactical Pan Studio</h1>
+          <p class="intro">Turn one fixed wide-angle game recording into a calm, tactical camera view.</p>
+        </div>
+        <div class="local-badge"><span></span> Runs locally</div>
+      </header>
+
+      <nav class="steps" aria-label="Workflow progress">
+        <button class="step active" data-step="1"><b>1</b><span>Select video</span></button>
+        <button class="step" data-step="2" disabled><b>2</b><span>Active area</span></button>
+        <button class="step" data-step="3" disabled><b>3</b><span>Review mask</span></button>
+        <button class="step" data-step="4" disabled><b>4</b><span>Process</span></button>
+      </nav>
+
+      <section class="panel active" id="panel-1">
+        <div class="panel-heading">
+          <p class="section-number">Step 1</p>
+          <h2>Choose the full game video</h2>
+          <p>The video stays on this computer. Large 4K files may take a moment to prepare.</p>
+        </div>
+        <label class="drop-zone" id="drop-zone">
+          <input id="video-input" type="file" accept="video/mp4,.mp4" />
+          <span class="drop-mark">＋</span>
+          <strong>Choose a video</strong>
+          <small>MP4 in the fixed game-camera format</small>
+        </label>
+        <div class="upload-state hidden" id="upload-state">
+          <div class="file-row"><span id="upload-name"></span><span id="upload-percent">0%</span></div>
+          <div class="progress-track"><div id="upload-bar"></div></div>
+          <p id="upload-message">Copying video into the local workspace…</p>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-2">
+        <div class="panel-heading split-heading">
+          <div>
+            <p class="section-number">Step 2</p>
+            <h2>Outline the active playing area</h2>
+            <p>Free-draw one continuous red loop around the part of the field that should influence the camera.</p>
+          </div>
+          <div class="video-facts" id="video-facts"></div>
+        </div>
+        <div class="outline-workspace" id="outline-workspace">
+          <div class="canvas-wrap">
+            <canvas id="area-canvas" aria-label="Draw the active playing area"></canvas>
+            <div class="canvas-hint">Draw in as many strokes as needed · each new stroke connects to the last</div>
+          </div>
+          <div class="tool-row">
+            <button class="button ghost" id="fullscreen-outline">Full screen</button>
+            <div class="actions">
+              <button class="button ghost" id="undo-outline" disabled>Undo last line</button>
+              <button class="button ghost" id="clear-outline" disabled>Clear outline</button>
+              <button class="button primary" id="generate-preview" disabled>Generate preview</button>
+            </div>
+          </div>
+        </div>
+        <p class="error-message" id="outline-error"></p>
+      </section>
+
+      <section class="panel" id="panel-3">
+        <div class="panel-heading">
+          <p class="section-number">Step 3</p>
+          <h2>Check the detection boundary</h2>
+          <p>Green is active. Red is ignored. Make sure sidelines, tents, and neighboring games are red.</p>
+        </div>
+        <div class="preview-frame"><img id="mask-preview" alt="Active-area mask preview" /></div>
+        <div class="review-key">
+          <span><i class="key-green"></i>Used for tracking</span>
+          <span><i class="key-red"></i>Ignored</span>
+        </div>
+        <div class="actions end-actions">
+          <button class="button ghost" id="adjust-outline">Adjust outline</button>
+          <button class="button primary" id="approve-preview">Looks good</button>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-4">
+        <div class="panel-heading">
+          <p class="section-number">Step 4</p>
+          <h2>Generate the tactical camera</h2>
+          <p>The player analysis and final render run in the background. Longer games can take several minutes.</p>
+        </div>
+        <div id="process-ready" class="process-card">
+          <div>
+            <strong id="process-filename">Ready to process</strong>
+            <span>2560 × 1440 output · source audio retained</span>
+            <label class="debug-option">
+              <input id="debug-toggle" type="checkbox" />
+              <span><b>Generate debug review video</b><small>Adds a full-width detection overlay and takes longer.</small></span>
+            </label>
+          </div>
+          <button class="button primary large" id="process-button">Process video</button>
+        </div>
+        <div id="process-running" class="process-running hidden">
+          <div class="orbit"><span></span></div>
+          <h3 id="process-message">Starting player analysis…</h3>
+          <div class="progress-track large-track"><div id="process-bar"></div></div>
+          <p><span id="process-percent">0%</span> complete · You can leave this tab open.</p>
+        </div>
+        <div id="process-complete" class="complete-state hidden">
+          <p class="complete-kicker">Processing complete</p>
+          <h3>Your tactical video is ready.</h3>
+          <video id="output-video" controls playsinline></video>
+          <div class="actions end-actions">
+            <a class="button ghost hidden" id="debug-download">Download review video</a>
+            <a class="button primary" id="output-download">Save tactical video</a>
+          </div>
+        </div>
+        <p class="error-message" id="process-error"></p>
+        <div class="actions cleanup-actions">
+          <button class="button danger" id="delete-job">Delete current job’s working files</button>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

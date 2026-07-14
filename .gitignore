@@ -1,0 +1,38 @@
+.venv/
+node_modules/
+
+# Local processing jobs and generated review media
+prototype/
+runs/
+gui_jobs/
+
+# Video inputs and exports
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.m4v
+
+# Downloaded/exported model weights
+*.pt
+*.onnx
+*.engine
+*.torchscript
+*.tflite
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.matplotlib/
+.ultralytics/
+*.log
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

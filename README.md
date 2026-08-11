@@ -51,8 +51,9 @@ When `--debug` is supplied, `debug-wide.mp4` shows retained detections and the
 smoothed crop. Without it, only the faster `tactical-crop.mp4` render is created.
 The crop decisions are also saved as `pan-path.csv` and `analysis.json`.
 
-The default tracking window and final deliverable are both 2560x1440, retaining
-the full detail of the tactical crop. To define the field, draw one thick, closed bright-red outline around
+Tracking is currently calibrated for the project's fixed wide-angle 4K source.
+The tracking window and final deliverable are both 2560x1440, retaining the full
+detail of the tactical crop. To define the field, draw one thick, closed bright-red outline around
 the valid playing area on any uncropped frame and pass it with `--play-area`. The
 generated `play-area-preview.jpg` tints excluded areas red so the mask can be
 checked before relying on it.
@@ -82,3 +83,9 @@ still provide a weak, safe signal: copy
 pass it with `--disc-points`. Direction is `1` for right and `-1` for left. The
 camera gives 15% of the crop width as look room in that direction, while the
 player formation remains the dominant signal.
+
+Fast deep pairs are tracked automatically. The tracker tolerates brief missed
+detections, begins the pan about one second before a pair is fully confirmed,
+and reserves space ahead of the leading runner. Use `--deep-lookahead` to tune
+the forward projection (the default is 0.85 seconds), or `--no-deep-tracking`
+to compare against formation-only framing.

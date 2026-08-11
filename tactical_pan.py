@@ -99,8 +99,13 @@ def select_field_players(
         x1, y1, x2, y2 = map(float, box)
         height = y2 - y1
         center_x = (x1 + x2) / 2
-        left, right = field_bounds(y2, width)
-        if height < 45 or y2 < 930 or not (left <= center_x <= right):
+        if play_area_mask is None:
+            left, right = field_bounds(y2, width)
+            if height < 45 or y2 < 930 or not (left <= center_x <= right):
+                continue
+        elif height < 26.0:
+            # The operator-drawn mask is more reliable than camera-specific
+            # perspective rules, especially for small players on deep cuts.
             continue
         foot_x = int(np.clip(center_x, 0, width - 1))
         foot_y = int(np.clip(y2 - 2, 0, play_area_mask.shape[0] - 1)) if play_area_mask is not None else 0
@@ -129,27 +134,52 @@ def select_field_players(
 def suppress_stationary_tracks(records: list[dict], sample_rate: float):
     """Down-weight people who remain in one patch for most of the point."""
     tracks: dict[int, list[tuple[int, dict]]] = {}
-    previous: dict[int, tuple[float, float]] = {}
+    track_state: dict[int, dict] = {}
     next_track_id = 0
-    max_distance = 280.0
+    maximum_gap = max(1, round(1.5 * sample_rate))
+    base_distance = 420.0
 
     for frame_index, record in enumerate(records):
+        track_state = {
+            track_id: state
+            for track_id, state in track_state.items()
+            if frame_index - state["frame"] <= maximum_gap
+        }
         players = record["players"]
         pairs = []
         for player_index, player in enumerate(players):
-            for track_id, position in previous.items():
-                distance = math.hypot(player["center_x"] - position[0], player["center_y"] - position[1])
-                if distance <= max_distance:
-                    pairs.append((distance, player_index, track_id))
+            for track_id, state in track_state.items():
+                gap = frame_index - state["frame"]
+                if gap > maximum_gap:
+                    continue
+                predicted_x = state["x"] + state["vx"] * gap
+                predicted_y = state["y"] + state["vy"] * gap
+                distance = math.hypot(player["center_x"] - predicted_x, player["center_y"] - predicted_y)
+                gate = base_distance * (1.0 + 0.35 * (gap - 1))
+                height_ratio = player["height"] / max(1.0, state["height"])
+                if distance <= gate and 0.5 <= height_ratio <= 2.0:
+                    size_penalty = abs(math.log(height_ratio)) * 0.35
+                    gap_penalty = 0.15 * (gap - 1)
+                    score = distance / base_distance + size_penalty + gap_penalty
+                    pairs.append((score, player_index, track_id, gap))
         assigned_players, assigned_tracks = set(), set()
-        current = {}
-        for _, player_index, track_id in sorted(pairs):
+        for _, player_index, track_id, gap in sorted(pairs):
             if player_index in assigned_players or track_id in assigned_tracks:
                 continue
             player = players[player_index]
+            state = track_state[track_id]
+            observed_vx = (player["center_x"] - state["x"]) / gap
+            observed_vy = (player["center_y"] - state["y"]) / gap
             player["track_id"] = track_id
             tracks[track_id].append((frame_index, player))
-            current[track_id] = (player["center_x"], player["center_y"])
+            track_state[track_id] = {
+                "x": player["center_x"],
+                "y": player["center_y"],
+                "vx": 0.55 * state["vx"] + 0.45 * observed_vx,
+                "vy": 0.55 * state["vy"] + 0.45 * observed_vy,
+                "height": player["height"],
+                "frame": frame_index,
+            }
             assigned_players.add(player_index)
             assigned_tracks.add(track_id)
         for player_index, player in enumerate(players):
@@ -159,8 +189,14 @@ def suppress_stationary_tracks(records: list[dict], sample_rate: float):
             next_track_id += 1
             player["track_id"] = track_id
             tracks[track_id] = [(frame_index, player)]
-            current[track_id] = (player["center_x"], player["center_y"])
-        previous = current
+            track_state[track_id] = {
+                "x": player["center_x"],
+                "y": player["center_y"],
+                "vx": 0.0,
+                "vy": 0.0,
+                "height": player["height"],
+                "frame": frame_index,
+            }
 
     minimum_samples = round(10.0 * sample_rate)
     for observations in tracks.values():
@@ -206,17 +242,24 @@ def calculate_raw_centers(records: list[dict], width: int):
 
 def identify_deep_pairs(records: list[dict], sample_rate: float):
     """Find persistent, fast breakaway tracks without chasing every deep cut."""
+    pending_pair: tuple[int, int] | None = None
     pending_direction = 0
     pending_count = 0
     active_track_ids: list[int] = []
     active_direction = 0
-    active_deep_x = None
     hold_samples = 0
+    last_members: dict[int, dict] = {}
 
-    for record in records:
+    for record_index, record in enumerate(records):
         baseline = record["raw_center_x"]
         groups = {-1: [], 1: []}
         for player in record["players"]:
+            track_id = int(player["track_id"])
+            last_members[track_id] = {
+                "x": float(player["center_x"]),
+                "velocity_x": float(player.get("velocity_x", 0.0)),
+                "record_index": record_index,
+            }
             velocity_x = player.get("velocity_x", 0.0)
             direction = 1 if velocity_x > 0 else -1
             lead = direction * (player["center_x"] - baseline)
@@ -250,39 +293,100 @@ def identify_deep_pairs(records: list[dict], sample_rate: float):
         candidate_confirmed = False
         if candidate:
             _, direction, players = candidate
-            if direction == pending_direction:
+            pair = tuple(sorted(int(player["track_id"]) for player in players))
+            if pair == pending_pair and direction == pending_direction:
                 pending_count += 1
             else:
+                pending_pair = pair
                 pending_direction = direction
                 pending_count = 1
             if pending_count >= 2:
-                active_track_ids = [int(player["track_id"]) for player in players]
+                active_track_ids = list(pair)
                 active_direction = direction
                 hold_samples = round(3.0 * sample_rate)
                 candidate_confirmed = True
         else:
-            pending_count = max(0, pending_count - 1)
+            pending_pair = None
+            pending_direction = 0
+            pending_count = 0
 
-        active_players = [
-            player for player in record["players"] if int(player.get("track_id", -1)) in active_track_ids
-        ]
-        if active_players:
-            deep_x = float(np.mean([player["center_x"] for player in active_players]))
-            active_deep_x = deep_x
-        if hold_samples > 0 and active_deep_x is not None:
+        member_positions = []
+        member_velocities = []
+        for track_id in active_track_ids:
+            member = last_members.get(track_id)
+            if member is None:
+                continue
+            elapsed = (record_index - member["record_index"]) / sample_rate
+            if elapsed > 1.5:
+                continue
+            member_positions.append(member["x"] + member["velocity_x"] * elapsed)
+            member_velocities.append(member["velocity_x"])
+
+        if hold_samples > 0 and member_positions:
             if not candidate_confirmed:
                 hold_samples -= 1
             record["deep_track_ids"] = active_track_ids.copy()
             record["deep_direction"] = active_direction
-            record["deep_center_x"] = round(float(active_deep_x), 2)
+            record["deep_pair_min_x"] = round(float(min(member_positions)), 2)
+            record["deep_pair_max_x"] = round(float(max(member_positions)), 2)
+            record["deep_center_x"] = round(float(np.mean(member_positions)), 2)
+            leading_index = int(np.argmax(np.array(member_positions) * active_direction))
+            record["deep_leading_x"] = round(float(member_positions[leading_index]), 2)
+            record["deep_velocity_x"] = round(float(member_velocities[leading_index]), 2)
             record["deep_active"] = True
         else:
             active_track_ids = []
             active_direction = 0
-            active_deep_x = None
             record["deep_track_ids"] = []
             record["deep_direction"] = 0
             record["deep_active"] = False
+
+    # Detection uses future frames already, so make that offline advantage
+    # explicit: start moving before the confirmed pair reaches the crop edge.
+    pre_roll_samples = max(1, round(1.0 * sample_rate))
+    for index, record in enumerate(records):
+        if not record.get("deep_active") or (index and records[index - 1].get("deep_active")):
+            continue
+        anchor_players = {
+            int(player["track_id"]): player
+            for player in record["players"]
+            if int(player.get("track_id", -1)) in record["deep_track_ids"]
+        }
+        for earlier_index in range(max(0, index - pre_roll_samples), index):
+            earlier = records[earlier_index]
+            if earlier.get("deep_active"):
+                continue
+            elapsed = (index - earlier_index) / sample_rate
+            positions = []
+            velocities = []
+            earlier_players = {int(player.get("track_id", -1)): player for player in earlier["players"]}
+            for track_id in record["deep_track_ids"]:
+                player = earlier_players.get(track_id) or anchor_players.get(track_id)
+                if player is None:
+                    continue
+                velocity = float(player.get("velocity_x", 0.0))
+                position = float(player["center_x"])
+                if track_id not in earlier_players:
+                    position -= velocity * elapsed
+                positions.append(position)
+                velocities.append(velocity)
+            if not positions:
+                continue
+            direction = int(record["deep_direction"])
+            leading_index = int(np.argmax(np.array(positions) * direction))
+            earlier.update(
+                {
+                    "deep_track_ids": record["deep_track_ids"].copy(),
+                    "deep_direction": direction,
+                    "deep_pair_min_x": round(float(min(positions)), 2),
+                    "deep_pair_max_x": round(float(max(positions)), 2),
+                    "deep_center_x": round(float(np.mean(positions)), 2),
+                    "deep_leading_x": round(float(positions[leading_index]), 2),
+                    "deep_velocity_x": round(float(velocities[leading_index]), 2),
+                    "deep_active": True,
+                    "deep_preroll": True,
+                }
+            )
 
 
 def apply_deep_coverage(args, records: list[dict], centers: np.ndarray) -> np.ndarray:
@@ -291,11 +395,28 @@ def apply_deep_coverage(args, records: list[dict], centers: np.ndarray) -> np.nd
         return centers
     desired = centers.copy()
     safe_half = args.crop_width / 2 - 310
+    lookahead = getattr(args, "deep_lookahead", 0.85)
     for index, record in enumerate(records):
         if record.get("deep_active"):
-            deep_x = record["deep_center_x"]
-            minimum_center = deep_x - safe_half
-            maximum_center = deep_x + safe_half
+            pair_min = record.get("deep_pair_min_x", record["deep_center_x"])
+            pair_max = record.get("deep_pair_max_x", record["deep_center_x"])
+            direction = record.get("deep_direction", 1)
+            leading = record.get("deep_leading_x", record["deep_center_x"])
+            velocity = record.get("deep_velocity_x", 0.0)
+            projected_lead = leading + direction * min(
+                args.crop_width * 0.28,
+                max(0.0, direction * velocity * lookahead),
+            )
+            if direction > 0:
+                pair_max = max(pair_max, projected_lead)
+            else:
+                pair_min = min(pair_min, projected_lead)
+            minimum_center = pair_max - safe_half
+            maximum_center = pair_min + safe_half
+            if minimum_center > maximum_center:
+                # If the entire envelope cannot fit, favor the leading edge.
+                target = minimum_center if direction > 0 else maximum_center
+                minimum_center = maximum_center = target
             desired[index] = np.clip(desired[index], minimum_center, maximum_center)
 
     # Limit the extra camera movement and soften mode entry/exit.
@@ -385,7 +506,14 @@ def apply_manual_corrections(args, times: np.ndarray, centers: np.ndarray) -> np
     return result
 
 
-def analyze(args, model: YOLO, cap: cv2.VideoCapture, width: int, fps: float, play_area_mask):
+def analyze(
+    args,
+    model: YOLO,
+    cap: cv2.VideoCapture,
+    width: int,
+    fps: float,
+    play_area_mask,
+):
     sample_times = np.arange(args.start, args.end + 1e-6, 1 / args.sample_rate)
     records = []
     for index, timestamp in enumerate(sample_times):
@@ -546,6 +674,7 @@ def parse_args():
     parser.add_argument("--disc-weight", type=float, default=0.22)
     parser.add_argument("--disc-radius", type=float, default=2.0)
     parser.add_argument("--look-room", type=float, default=0.15, help="Crop-width fraction shown ahead of the disc")
+    parser.add_argument("--deep-lookahead", type=float, default=0.85, help="Seconds to project a deep pair's leading edge")
     parser.add_argument("--no-deep-tracking", action="store_true", help="Disable fast breakaway-pair coverage")
     parser.add_argument("--debug", action="store_true", help="Also render the full-width detection review video")
     parser.add_argument("--analysis-only", action="store_true", help="Save detection and pan data without rendering video")

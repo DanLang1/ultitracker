@@ -63,6 +63,67 @@ class GuiJobControlTest(unittest.TestCase):
         self.assertEqual(len(starts), 1)
         self.assertEqual(gui.job_status[self.job_id]["state"], "processing")
         self.assertFalse(gui.read_metadata(self.job_id)["generate_debug"])
+        self.assertTrue(gui.read_metadata(self.job_id)["auto_widen"])
+
+    def test_process_persists_disabled_auto_widen(self):
+        class FakeThread:
+            def __init__(self, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        client = gui.app.test_client()
+        with patch.object(gui.threading, "Thread", FakeThread):
+            response = client.post(
+                f"/api/process/{self.job_id}",
+                json={"debug": False, "auto_widen": False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(gui.read_metadata(self.job_id)["auto_widen"])
+
+    def test_run_processor_maps_disabled_auto_widen_to_cli_option(self):
+        gui.write_metadata(
+            self.job_id,
+            {
+                **gui.read_metadata(self.job_id),
+                "generate_debug": False,
+                "auto_widen": False,
+            },
+        )
+
+        class FakeProcess:
+            def wait(self):
+                return 0
+
+            def __init__(self):
+                self.stdout = FakeStdout()
+
+        class FakeStdout(list):
+            def close(self):
+                pass
+
+        with patch.object(gui.subprocess, "Popen", return_value=FakeProcess()) as popen:
+            gui.run_processor(self.job_id)
+
+        command = popen.call_args.args[0]
+        self.assertIn("--no-auto-widen", command)
+
+    def test_run_processor_defaults_auto_widen_on_for_older_job(self):
+        class FakeStdout(list):
+            def close(self):
+                pass
+
+        with patch.object(gui.subprocess, "Popen") as popen:
+            process = popen.return_value
+            process.stdout = FakeStdout()
+            process.wait.return_value = 0
+            gui.run_processor(self.job_id)
+
+        command = popen.call_args.args[0]
+        self.assertNotIn("--no-auto-widen", command)
+        self.assertEqual(gui.job_status[self.job_id]["state"], "complete")
 
     def test_delete_job_removes_working_directory(self):
         client = gui.app.test_client()

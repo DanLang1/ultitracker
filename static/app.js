@@ -198,7 +198,10 @@ $('#process-button').addEventListener('click', async () => {
     const response = await fetch(`/api/process/${state.jobId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ debug: $('#debug-toggle').checked }),
+      body: JSON.stringify({
+        debug: $('#debug-toggle').checked,
+        auto_widen: $('#auto-widen-toggle').checked,
+      }),
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not start processing.');

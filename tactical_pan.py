@@ -303,7 +303,7 @@ def identify_deep_pairs(records: list[dict], sample_rate: float):
             if pending_count >= 2:
                 active_track_ids = list(pair)
                 active_direction = direction
-                hold_samples = round(3.0 * sample_rate)
+                hold_samples = round(2.5 * sample_rate)
                 candidate_confirmed = True
         else:
             pending_pair = None
@@ -342,8 +342,8 @@ def identify_deep_pairs(records: list[dict], sample_rate: float):
             record["deep_active"] = False
 
     # Detection uses future frames already, so make that offline advantage
-    # explicit: start moving before the confirmed pair reaches the crop edge.
-    pre_roll_samples = max(1, round(1.0 * sample_rate))
+    # explicit: begin a little before confirmation without committing too early.
+    pre_roll_samples = max(1, round(0.5 * sample_rate))
     for index, record in enumerate(records):
         if not record.get("deep_active") or (index and records[index - 1].get("deep_active")):
             continue
@@ -390,16 +390,73 @@ def identify_deep_pairs(records: list[dict], sample_rate: float):
 
 
 def apply_deep_coverage(args, records: list[dict], centers: np.ndarray) -> np.ndarray:
-    """Keep a persistent runner/defender pair safely visible."""
+    """Keep a persistent runner/defender pair safely visible.
+
+    Deep tracking is an optional second objective.  The formation visible to
+    the ordinary (median) center remains a hard constraint whenever it can be
+    represented in the crop.  This matters when a deep pair and a nearby
+    field player are on opposite sides of the source frame.
+    """
     if args.no_deep_tracking:
         return centers
+    if not any(record.get("deep_active") for record in records):
+        return centers
+
     desired = centers.copy()
     safe_half = args.crop_width / 2 - 310
-    lookahead = getattr(args, "deep_lookahead", 0.85)
+    lookahead = getattr(args, "deep_lookahead", 0.6)
+    crop_half = args.crop_width / 2
+    lower_bounds = np.full(len(records), crop_half)
+    source_width = getattr(args, "frame_width", None)
+    upper_default = float(source_width) - crop_half if source_width is not None else np.inf
+    upper_bounds = np.full(len(records), upper_default)
     for index, record in enumerate(records):
+        deep_ids = {int(track_id) for track_id in record.get("deep_track_ids", [])}
+        # Protect the extents of credible formation players.  Suppressed,
+        # stationary tracks are deliberately omitted: they are often crowd or
+        # sideline detections and should not freeze the camera.
+        formation = [] if getattr(args, "no_formation_protection", False) else [
+            player for player in record.get("players", [])
+            if int(player.get("track_id", -1)) not in deep_ids
+            and float(player.get("stationary_factor", 1.0)) >= 0.5
+        ]
+        if formation:
+            left = []
+            right = []
+            baseline_left = float(centers[index] - crop_half)
+            baseline_right = float(centers[index] + crop_half)
+            for player in formation:
+                box = player.get("box")
+                if box and len(box) >= 4:
+                    player_left = float(box[0])
+                    player_right = float(box[2])
+                else:
+                    x = float(player.get("center_x", centers[index]))
+                    player_left = player_right = x
+                # Only preserve players the formation-only crop actually
+                # showed. This avoids freezing on spectators or stale tracks
+                # outside the baseline's current window.
+                if player_right < baseline_left or player_left > baseline_right:
+                    continue
+                left.append(max(player_left, baseline_left))
+                right.append(min(player_right, baseline_right))
+            if left:
+                lower_bounds[index] = max(lower_bounds[index], max(right) - crop_half)
+                upper_bounds[index] = min(upper_bounds[index], min(left) + crop_half)
+                # The formation-only center is always a valid fallback, even when
+                # detector boxes are slightly inconsistent with their weighted median.
+                lower_bounds[index] = min(lower_bounds[index], float(centers[index]))
+                upper_bounds[index] = max(upper_bounds[index], float(centers[index]))
+                if lower_bounds[index] > upper_bounds[index]:
+                    lower_bounds[index] = upper_bounds[index] = float(centers[index])
+                    record["deep_baseline_infeasible"] = True
+                record["deep_protected_baseline_min"] = round(float(lower_bounds[index]), 2)
+                record["deep_protected_baseline_max"] = round(float(upper_bounds[index]), 2)
+
         if record.get("deep_active"):
             pair_min = record.get("deep_pair_min_x", record["deep_center_x"])
             pair_max = record.get("deep_pair_max_x", record["deep_center_x"])
+            actual_pair_min, actual_pair_max = pair_min, pair_max
             direction = record.get("deep_direction", 1)
             leading = record.get("deep_leading_x", record["deep_center_x"])
             velocity = record.get("deep_velocity_x", 0.0)
@@ -417,18 +474,119 @@ def apply_deep_coverage(args, records: list[dict], centers: np.ndarray) -> np.nd
                 # If the entire envelope cannot fit, favor the leading edge.
                 target = minimum_center if direction > 0 else maximum_center
                 minimum_center = maximum_center = target
-            desired[index] = np.clip(desired[index], minimum_center, maximum_center)
+            deep_target = float(np.clip(desired[index], minimum_center, maximum_center))
+            record["deep_coverage_target_x"] = round(deep_target, 2)
+            # Formation coverage wins when the two objectives conflict.  This
+            # also naturally gives up the optional 310px deep margin first.
+            feasible_min = max(minimum_center, lower_bounds[index])
+            feasible_max = min(maximum_center, upper_bounds[index])
+            actual_min = max(actual_pair_max - crop_half, lower_bounds[index])
+            actual_max = min(actual_pair_min + crop_half, upper_bounds[index])
+            record["deep_actual_pair_feasible"] = bool(actual_min <= actual_max)
+            if feasible_min <= feasible_max:
+                desired[index] = np.clip(deep_target, feasible_min, feasible_max)
+                record["deep_pair_feasible"] = True
+            else:
+                desired[index] = np.clip(deep_target, lower_bounds[index], upper_bounds[index])
+                record["deep_pair_feasible"] = False
 
     # Limit the extra camera movement and soften mode entry/exit.
     kernel = np.array([1, 2, 3, 2, 1], dtype=float)
     kernel /= kernel.sum()
-    desired = np.convolve(np.pad(desired, (2, 2), mode="edge"), kernel, mode="valid")
+    # Smooth only the deep correction. Re-smoothing absolute formation centers
+    # would alter long stretches that have no deep signal.
+    correction = desired - centers
+    correction = np.convolve(np.pad(correction, (2, 2), mode="edge"), kernel, mode="valid")
+    desired = centers + correction
+    max_step = 570.0 / args.sample_rate
+    # Work backwards to remove targets that cannot reach a future protected
+    # interval at the permitted speed. The formation center is retained when
+    # an interval is intrinsically infeasible.
+    corridor_min = lower_bounds.copy()
+    corridor_max = upper_bounds.copy()
+    for index in range(len(records) - 2, -1, -1):
+        next_min, next_max = corridor_min[index + 1], corridor_max[index + 1]
+        reachable_min = next_min - max_step
+        reachable_max = next_max + max_step
+        new_min = max(corridor_min[index], reachable_min)
+        new_max = min(corridor_max[index], reachable_max)
+        if new_min <= new_max:
+            corridor_min[index], corridor_max[index] = new_min, new_max
     result = np.empty_like(desired)
-    result[0] = desired[0]
-    max_step = 620.0 / args.sample_rate
+    result[0] = np.clip(desired[0], corridor_min[0], corridor_max[0])
     for index in range(1, len(desired)):
-        result[index] = result[index - 1] + np.clip(desired[index] - result[index - 1], -max_step, max_step)
+        reachable_min = result[index - 1] - max_step
+        reachable_max = result[index - 1] + max_step
+        allowed_min = max(corridor_min[index], reachable_min)
+        allowed_max = min(corridor_max[index], reachable_max)
+        if allowed_min <= allowed_max:
+            result[index] = np.clip(desired[index], allowed_min, allowed_max)
+        else:
+            # A sudden, impossible constraint should not create a camera jump;
+            # retain the speed-limited path and report that protection lost.
+            result[index] = np.clip(desired[index], reachable_min, reachable_max)
+            records[index]["deep_protection_speed_limited"] = True
     return result
+
+
+def plan_crop_widths(args, records: list[dict], centers: np.ndarray, source_width: int, source_height: int) -> np.ndarray:
+    """Plan restrained variable widths for active deep pairs."""
+    base = float(args.crop_width)
+    widths = np.full(len(records), base)
+    if not records:
+        return widths
+    if getattr(args, "no_auto_widen", False) or getattr(args, "no_deep_tracking", False):
+        return widths
+    cap = min(base * 1.35, float(source_width))
+    for i, record in enumerate(records):
+        if record.get("deep_active"):
+            pair_min = np.clip(float(record.get("deep_pair_min_x", record.get("deep_center_x", 0))) - 80.0, 0, source_width)
+            pair_max = np.clip(float(record.get("deep_pair_max_x", record.get("deep_center_x", 0))) + 80.0, 0, source_width)
+            center = float(np.clip(centers[i], 0, source_width))
+            # Expansion stays centered until it reaches a source edge. After
+            # that, the opposite edge advances by the full added width.
+            left_width = min(2 * (center - pair_min), source_width - pair_min)
+            right_width = min(2 * (pair_max - center), pair_max)
+            widths[i] = min(cap, max(base, left_width, right_width))
+    hold = max(1, round(1.5 * args.sample_rate))
+    raw_widths = widths.copy()
+    for i in range(len(widths)):
+        widths[i] = max(raw_widths[max(0, i - hold):i + 1])
+    result = np.empty_like(widths)
+    expand = 700.0 / args.sample_rate
+    contract = 220.0 / args.sample_rate
+    result[-1] = widths[-1]
+    for i in range(len(widths) - 2, -1, -1):
+        result[i] = max(widths[i], result[i + 1] - expand)
+    for i in range(1, len(widths)):
+        result[i] = max(result[i], result[i - 1] - contract)
+    return np.clip(result, base, cap)
+
+
+def apply_crop_geometry(args, records: list[dict], centers: np.ndarray, source_width: int, source_height: int):
+    widths = plan_crop_widths(args, records, centers, source_width, source_height)
+    base_ratio = args.crop_height / args.crop_width
+    for record, center, width in zip(records, centers, widths):
+        crop_height = min(float(source_height), width * base_ratio)
+        half = width / 2
+        center = float(np.clip(center, half, source_width - half))
+        record["crop_width"] = round(width, 2)
+        record["crop_height"] = round(crop_height, 2)
+        record["center_x"] = round(center, 2)
+        record["crop_x"] = round(center - half, 2)
+        record["crop_y"] = round(source_height - crop_height, 2)
+    return widths
+
+
+def letterbox_crop(frame: np.ndarray, crop_x: int, crop_y: int, crop_width: int, crop_height: int, out_width: int, out_height: int) -> np.ndarray:
+    cropped = frame[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
+    scale = min(out_width / cropped.shape[1], out_height / cropped.shape[0])
+    resized = cv2.resize(cropped, (round(cropped.shape[1] * scale), round(cropped.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+    rendered = np.zeros((out_height, out_width, 3), dtype=np.uint8)
+    oy = (out_height - resized.shape[0]) // 2
+    ox = (out_width - resized.shape[1]) // 2
+    rendered[oy:oy + resized.shape[0], ox:ox + resized.shape[1]] = resized
+    return rendered
 
 
 def smooth_centers(raw: np.ndarray, crop_width: int, frame_width: int, sample_rate: float):
@@ -506,24 +664,68 @@ def apply_manual_corrections(args, times: np.ndarray, centers: np.ndarray) -> np
     return result
 
 
+def analysis_decoder_command(args, sample_count: int) -> list[str]:
+    """Decode analysis samples in one pass instead of seeking for every frame."""
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", str(args.start), "-i", str(args.input),
+        "-vf", f"fps={args.sample_rate}:start_time=0",
+        "-frames:v", str(sample_count),
+        "-an", "-sn", "-dn",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
+    ]
+
+
+def sampled_analysis_frames(args, width: int, height: int, sample_times: np.ndarray):
+    """Yield fixed-rate, full-resolution BGR frames from one FFmpeg decoder."""
+    process = subprocess.Popen(
+        analysis_decoder_command(args, len(sample_times)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    frame_size = width * height * 3
+    completed = False
+    try:
+        for index, timestamp in enumerate(sample_times):
+            data = bytearray()
+            while len(data) < frame_size:
+                chunk = process.stdout.read(frame_size - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if not data:
+                break
+            if len(data) != frame_size:
+                raise RuntimeError(
+                    f"FFmpeg returned a partial analysis frame ({len(data)} of {frame_size} bytes)"
+                )
+            frame = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+            yield index, timestamp, frame
+        completed = True
+    finally:
+        process.stdout.close()
+        if not completed and process.poll() is None:
+            process.terminate()
+        return_code = process.wait()
+        error = process.stderr.read().decode(errors="replace").strip()
+        process.stderr.close()
+        if completed and return_code:
+            raise RuntimeError(error or f"FFmpeg analysis decoder exited with status {return_code}")
+
+
 def analyze(
     args,
     model: YOLO,
-    cap: cv2.VideoCapture,
     width: int,
-    fps: float,
+    height: int,
     play_area_mask,
 ):
+    args.frame_width = width
     sample_times = np.arange(args.start, args.end + 1e-6, 1 / args.sample_rate)
     records = []
-    for index, timestamp in enumerate(sample_times):
-        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-        ok, frame = cap.read()
-        if not ok:
-            if records and timestamp >= args.end - (1 / args.sample_rate):
-                print(f"Reached the end of the video at {timestamp:.2f}s; using {len(records)} completed samples.")
-                break
-            raise RuntimeError(f"Could not decode frame at {timestamp:.2f}s")
+    for index, timestamp, frame in sampled_analysis_frames(args, width, height, sample_times):
         result = model.predict(
             frame,
             imgsz=args.inference_size,
@@ -545,6 +747,13 @@ def analyze(
         )
         print(f"Analyzed {index + 1:3d}/{len(sample_times)} at {timestamp:6.2f}s: {len(players):2d} field players")
 
+    if len(records) < len(sample_times):
+        missing_time = float(sample_times[len(records)])
+        if records and missing_time >= args.end - (1 / args.sample_rate):
+            print(f"Reached the end of the video at {missing_time:.2f}s; using {len(records)} completed samples.")
+        else:
+            raise RuntimeError(f"Could not decode frame at {missing_time:.2f}s")
+
     suppress_stationary_tracks(records, args.sample_rate)
     calculate_raw_centers(records, width)
     identify_deep_pairs(records, args.sample_rate)
@@ -555,9 +764,7 @@ def analyze(
     smooth = apply_disc_anchors(args, relative_times, smooth)
     smooth = apply_manual_corrections(args, relative_times, smooth)
     smooth = np.clip(smooth, args.crop_width / 2, width - args.crop_width / 2)
-    for record, center in zip(records, smooth):
-        record["center_x"] = round(float(center), 2)
-        record["crop_x"] = int(round(center - args.crop_width / 2))
+    apply_crop_geometry(args, records, smooth, width, height)
     return records
 
 
@@ -585,7 +792,8 @@ def render(args, records, source_width: int, source_height: int, fps: float, out
     total_frames = int(round((args.end - args.start) * fps))
     sample_times = np.array([r["time"] for r in records])
     crop_xs = np.array([r["crop_x"] for r in records])
-    crop_y = source_height - args.crop_height
+    crop_widths = np.array([r.get("crop_width", args.crop_width) for r in records])
+    crop_heights = np.array([r.get("crop_height", args.crop_height) for r in records])
 
     try:
         for frame_index in range(total_frames):
@@ -594,6 +802,10 @@ def render(args, records, source_width: int, source_height: int, fps: float, out
                 break
             relative_time = frame_index / fps
             crop_x = int(round(np.interp(relative_time, sample_times, crop_xs)))
+            crop_width = int(round(np.interp(relative_time, sample_times, crop_widths)))
+            crop_height = int(round(np.interp(relative_time, sample_times, crop_heights)))
+            crop_x = int(np.clip(crop_x, 0, source_width - crop_width))
+            crop_y = source_height - crop_height
             if debug:
                 sample_index = int(np.argmin(np.abs(sample_times - relative_time)))
                 deep_ids = set(records[sample_index].get("deep_track_ids", []))
@@ -620,7 +832,7 @@ def render(args, records, source_width: int, source_height: int, fps: float, out
                 cv2.rectangle(
                     frame,
                     (crop_x, crop_y),
-                    (crop_x + args.crop_width - 1, crop_y + args.crop_height - 1),
+                    (crop_x + crop_width - 1, crop_y + crop_height - 1),
                     (0, 220, 255),
                     9,
                 )
@@ -636,9 +848,7 @@ def render(args, records, source_width: int, source_height: int, fps: float, out
                 )
                 rendered = cv2.resize(frame, (out_width, out_height), interpolation=cv2.INTER_AREA)
             else:
-                rendered = frame[crop_y:crop_y + args.crop_height, crop_x:crop_x + args.crop_width]
-                if rendered.shape[1] != out_width or rendered.shape[0] != out_height:
-                    rendered = cv2.resize(rendered, (out_width, out_height), interpolation=cv2.INTER_AREA)
+                rendered = letterbox_crop(frame, crop_x, crop_y, crop_width, crop_height, out_width, out_height)
             assert encoder.stdin is not None
             encoder.stdin.write(rendered.tobytes())
             if frame_index % max(1, round(fps * 5)) == 0:
@@ -674,8 +884,13 @@ def parse_args():
     parser.add_argument("--disc-weight", type=float, default=0.22)
     parser.add_argument("--disc-radius", type=float, default=2.0)
     parser.add_argument("--look-room", type=float, default=0.15, help="Crop-width fraction shown ahead of the disc")
-    parser.add_argument("--deep-lookahead", type=float, default=0.85, help="Seconds to project a deep pair's leading edge")
+    parser.add_argument("--deep-lookahead", type=float, default=0.6, help="Seconds to project a deep pair's leading edge")
     parser.add_argument("--no-deep-tracking", action="store_true", help="Disable fast breakaway-pair coverage")
+    parser.add_argument(
+        "--no-formation-protection", action="store_true",
+        help="Allow deep tracking to ignore formation visibility (A/B comparison)",
+    )
+    parser.add_argument("--no-auto-widen", action="store_true", help="Keep the tactical crop at its fixed width")
     parser.add_argument("--debug", action="store_true", help="Also render the full-width detection review video")
     parser.add_argument("--analysis-only", action="store_true", help="Save detection and pan data without rendering video")
     return parser.parse_args()
@@ -690,6 +905,7 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = float(cap.get(cv2.CAP_PROP_FPS))
+    args.frame_width = width
     if args.crop_width > width or args.crop_height > height:
         raise ValueError("Crop is larger than the source video")
 
@@ -706,17 +922,17 @@ def main():
             cap.release()
             return
 
-    model = YOLO(args.model)
-    records = analyze(args, model, cap, width, fps, play_area_mask)
     cap.release()
+    model = YOLO(args.model)
+    records = analyze(args, model, width, height, play_area_mask)
 
     with (args.output_dir / "analysis.json").open("w") as handle:
         json.dump(records, handle, indent=2)
     with (args.output_dir / "pan-path.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["time_seconds", "source_time_seconds", "raw_center_x", "center_x", "crop_x"])
+        writer.writerow(["time_seconds", "source_time_seconds", "raw_center_x", "center_x", "crop_x", "crop_width", "crop_height", "crop_y"])
         for record in records:
-            writer.writerow([record[key] for key in ("time", "source_time", "raw_center_x", "center_x", "crop_x")])
+            writer.writerow([record[key] for key in ("time", "source_time", "raw_center_x", "center_x", "crop_x", "crop_width", "crop_height", "crop_y")])
     with (args.output_dir / "manual-corrections-template.csv").open("w", newline="") as handle:
         csv.writer(handle).writerow(["source_time_seconds", "center_x"])
     with (args.output_dir / "disc-points-template.csv").open("w", newline="") as handle:

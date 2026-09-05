@@ -52,8 +52,9 @@ smoothed crop. Without it, only the faster `tactical-crop.mp4` render is created
 The crop decisions are also saved as `pan-path.csv` and `analysis.json`.
 
 Tracking is currently calibrated for the project's fixed wide-angle 4K source.
-The tracking window and final deliverable are both 2560x1440, retaining the full
-detail of the tactical crop. To define the field, draw one thick, closed bright-red outline around
+The normal tracking window and final deliverable are both 2560x1440. Temporary
+widening includes more of the source at reduced scale, while the deliverable
+stays 2560x1440. To define the field, draw one thick, closed bright-red outline around
 the valid playing area on any uncropped frame and pass it with `--play-area`. The
 generated `play-area-preview.jpg` tints excluded areas red so the mask can be
 checked before relying on it.
@@ -85,7 +86,32 @@ camera gives 15% of the crop width as look room in that direction, while the
 player formation remains the dominant signal.
 
 Fast deep pairs are tracked automatically. The tracker tolerates brief missed
-detections, begins the pan about one second before a pair is fully confirmed,
-and reserves space ahead of the leading runner. Use `--deep-lookahead` to tune
-the forward projection (the default is 0.85 seconds), or `--no-deep-tracking`
-to compare against formation-only framing.
+detections, begins the pan about half a second before a pair is fully confirmed,
+and reserves space ahead of the leading runner. Deep coverage is bounded by the
+credible formation players visible in the same sample, so an anticipatory pan
+does not cut those players out; when both goals cannot fit, formation coverage
+is preferred and the optional deep margin is reduced. Use `--deep-lookahead` to
+tune the forward projection (the default is 0.6 seconds), or
+`--no-deep-tracking` to compare against formation-only framing.
+For an A/B run that favors deep-pair coverage when the two objectives compete,
+use `--no-formation-protection`. A mask that includes sideline spectators can
+cause formation protection to favor those spectators too; exclude them when
+defining the active area.
+
+When a deep pair approaches the crop edge, automatic widening gives it more
+room without abandoning the protected formation. The source window expands
+by at most 35%, remains inside the source, and preserves image proportions.
+Very wide views use letterboxing. Offline planning starts expansion early,
+holds the needed width for 1.5 seconds, and returns slowly to avoid repeated
+zooming. Expansion is limited to 700 source pixels per second and contraction
+to 220. These transitions can extend before and after a deep signal; sequences
+without deep signals stay at the normal width.
+
+**Allow gentle widening** is enabled by default in the processing screen.
+Uncheck it, or use `--no-auto-widen`, to keep the normal crop width.
+`pan-path.csv` and `analysis.json` include each sample's crop width, height,
+and position, and the debug video shows the actual variable crop.
+
+The tracker still cannot tell whether a deep cut was thrown to. The width cap
+also means extremely spread-out action may not fit; in that case the protected
+formation takes priority. Manual center corrections remain available.

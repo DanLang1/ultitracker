@@ -85,6 +85,7 @@ def update_status(job_id: str, **changes):
 def run_processor(job_id: str):
     metadata = read_metadata(job_id)
     generate_debug = bool(metadata.get("generate_debug", False))
+    auto_widen = bool(metadata.get("auto_widen", True))
     directory = job_directory(job_id)
     output_dir = directory / "output"
     output_dir.mkdir(exist_ok=True)
@@ -100,6 +101,8 @@ def run_processor(job_id: str):
     ]
     if generate_debug:
         command.append("--debug")
+    if not auto_widen:
+        command.append("--no-auto-widen")
     environment = os.environ.copy()
     environment.update(
         {
@@ -195,6 +198,7 @@ def upload_video():
             "filename": filename,
             "video_path": str(video_path),
             "preview_time": preview_time,
+            "auto_widen": True,
         }
         write_metadata(job_id, metadata)
         update_status(job_id, state="ready", progress=0, message="Draw the active area.")
@@ -262,6 +266,7 @@ def process_video(job_id: str):
                 return jsonify(job_status[job_id])
             metadata = read_metadata(job_id)
             metadata["generate_debug"] = bool(payload.get("debug", False))
+            metadata["auto_widen"] = bool(payload.get("auto_widen", True))
             write_metadata(job_id, metadata)
             job_status[job_id] = {
                 "state": "processing",

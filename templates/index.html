@@ -14,7 +14,7 @@
           <h1>Tactical Pan Studio</h1>
           <p class="intro">Turn one fixed wide-angle game recording into a calm, tactical camera view.</p>
         </div>
-        <div class="local-badge"><span></span> Runs locally</div>
+        <div class="actions"><button class="button ghost" id="choose-another">Choose another video</button><div class="local-badge"><span></span> Runs locally</div></div>
       </header>
 
       <nav class="steps" aria-label="Workflow progress">
@@ -41,6 +41,11 @@
           <div class="progress-track"><div id="upload-bar"></div></div>
           <p id="upload-message">Copying video into the local workspace…</p>
         </div>
+        <div id="saved-jobs" class="hidden">
+          <h3>Saved jobs</h3>
+          <div id="saved-job-list"></div>
+        </div>
+        <p class="error-message" id="jobs-error"></p>
       </section>
 
       <section class="panel" id="panel-2">
@@ -51,6 +56,14 @@
             <p>Free-draw one continuous red loop around the part of the field that should influence the camera.</p>
           </div>
           <div class="video-facts" id="video-facts"></div>
+        </div>
+        <div class="analysis-bar" id="analysis-bar">
+          <span id="analysis-status">Player analysis has not run yet.</span>
+          <div class="actions">
+            <label class="debug-option inline"><input id="heat-toggle" type="checkbox" checked /><span><b>Show where people usually stand</b></span></label>
+            <button class="button ghost hidden" id="run-analysis">Analyze players</button>
+            <button class="button ghost" id="use-suggestion" disabled>Use suggested outline</button>
+          </div>
         </div>
         <div class="outline-workspace" id="outline-workspace">
           <div class="canvas-wrap">
@@ -105,19 +118,21 @@
               <span><b>Allow gentle widening</b><small>Keeps spread-out action visible with a limited, gradual zoom out.</small></span>
             </label>
           </div>
-          <button class="button primary large" id="process-button">Process video</button>
+          <div class="actions"><button class="button ghost" id="edit-area">Adjust active area</button><button class="button primary large" id="process-button">Process video</button></div>
         </div>
+        <p class="hint" id="process-hint"></p>
         <div id="process-running" class="process-running hidden">
           <div class="orbit"><span></span></div>
           <h3 id="process-message">Starting player analysis…</h3>
           <div class="progress-track large-track"><div id="process-bar"></div></div>
-          <p><span id="process-percent">0%</span> complete · You can leave this tab open.</p>
+          <p><span id="process-percent">0%</span> complete · You can close this tab and return later. Keep the local server running.</p>
         </div>
         <div id="process-complete" class="complete-state hidden">
           <p class="complete-kicker">Processing complete</p>
           <h3>Your tactical video is ready.</h3>
           <video id="output-video" controls playsinline></video>
           <div class="actions end-actions">
+            <button class="button ghost" id="adjust-settings">Adjust settings</button>
             <a class="button ghost hidden" id="debug-download">Download review video</a>
             <a class="button primary" id="output-download">Save tactical video</a>
           </div>

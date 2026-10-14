@@ -419,8 +419,8 @@ def test_auto_widen_is_capped_and_rate_limited():
     records = [{"deep_active": True, "deep_pair_min_x": 1000.0, "deep_pair_max_x": 4500.0}] * 4
     widths = plan_crop_widths(args, records, np.full(4, 2304.0), 4608, 1728)
 
-    assert widths[-1] <= 3456.0 + 1e-9
-    assert np.all(np.diff(widths) <= 350.0 + 1e-9)
+    assert widths[-1] <= 2944.0 + 1e-9
+    assert np.all(np.diff(widths) <= 140.0 + 1e-9)
 
 
 def test_no_deep_keeps_fixed_crop_geometry_and_aspect_ratio():
@@ -451,11 +451,11 @@ def test_widening_prepares_for_tight_offscreen_pair_then_holds_and_releases():
 
     assert widths[0] == 2560
     assert widths[5] > 2560  # Offline ramp begins before the event.
-    assert widths[6] == 3456  # No late zoom when the pair arrives.
-    assert np.all(widths[6:10] == 3456)  # 1.5 seconds after the event.
+    assert widths[6] == 2944  # No late zoom when the pair arrives.
+    assert np.all(widths[6:10] == 2944)  # 1.5 seconds after the event.
     assert widths[10] < widths[9]
     assert widths[-1] == 2560
-    assert np.all(np.diff(widths) <= 350 + 1e-9)
+    assert np.all(np.diff(widths) <= 140 + 1e-9)
     assert np.all(np.diff(widths) >= -110 - 1e-9)
 
 
@@ -466,9 +466,9 @@ def test_later_small_widening_does_not_inherit_previous_peak():
     widths = plan_crop_widths(widening_args(), records, np.full(45, 2304.0), 4608, 1728)
 
     assert widths[20] == 2560
-    assert widths[30] == 2752
-    assert widths[33] == 2752
-    assert widths[34] < 2752
+    assert widths[30] == 2672
+    assert widths[33] == 2672
+    assert widths[34] < 2672
     assert widths[-1] == 2560
 
 
@@ -492,17 +492,34 @@ def test_widening_at_source_edge_preserves_existing_crop_and_avoids_wasted_margi
     record = {"deep_active": True, "deep_pair_min_x": pair_min, "deep_pair_max_x": pair_max}
     apply_crop_geometry(widening_args(), [record], np.array([center]), 4608, 1728)
 
-    assert record["crop_width"] == 2980  # Includes the 80px margin, after clamping the center.
+    assert record["crop_width"] == 2940  # Includes the 40px margin, after clamping the center.
     assert 0 <= record["crop_x"] <= 4608 - record["crop_width"]
     assert record["crop_x"] <= center - 1280
     assert record["crop_x"] + record["crop_width"] >= center + 1280
     assert record["crop_y"] + record["crop_height"] == 1728
 
 
+@pytest.mark.parametrize("sample_rate", [1., 2., 5.])
+def test_widening_rates_hold_at_different_sample_rates(sample_rate):
+    records = [{} for _ in range(int(20 * sample_rate))]
+    records[int(5 * sample_rate)] = deep_width_event()
+    widths = plan_crop_widths(widening_args(sample_rate=sample_rate), records,
+                              np.full(len(records), 2304.), 4608, 1728)
+    assert widths.max() == pytest.approx(2944.)
+    assert np.all(np.diff(widths) <= 280 / sample_rate + 1e-9)
+    assert np.all(np.diff(widths) >= -220 / sample_rate - 1e-9)
+
+
+def test_widening_with_no_spare_height_keeps_normal_width():
+    records = [deep_width_event() for _ in range(8)]
+    widths = plan_crop_widths(widening_args(), records, np.full(8, 2304.), 4608, 1440)
+    assert widths.tolist() == [2560.] * 8
+
+
 def test_widening_never_exceeds_source_dimensions():
     records = [deep_width_event(4000)]
     apply_crop_geometry(widening_args(), records, np.array([1400.0]), 3000, 1600)
-    assert records[0]["crop_width"] == 3000
+    assert records[0]["crop_width"] == pytest.approx(1600 * 16 / 9, abs=.01)
     assert records[0]["crop_height"] == 1600
     assert records[0]["crop_x"] == records[0]["crop_y"] == 0
 
@@ -524,14 +541,14 @@ def test_variable_crop_renders_decodable_video_with_fixed_output_dimensions(tmp_
     output = tmp_path / "rendered.mp4"
     subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "lavfi", "-i", "color=gray:size=192x72:rate=10:duration=1",
+        "-f", "lavfi", "-i", "color=gray:size=192x108:rate=10:duration=1",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
     ], check=True)
     args = widening_args(input=source, start=0., end=1., crop_width=128,
                          crop_height=72, output_width=128, output_height=72)
     records = [{"time": 0.}, {"time": .5, **deep_width_event(192)}]
-    apply_crop_geometry(args, records, np.full(2, 96.), 192, 72)
-    render(args, records, 192, 72, 10., output, debug=False)
+    apply_crop_geometry(args, records, np.full(2, 96.), 192, 108)
+    render(args, records, 192, 108, 10., output, debug=False)
     cap = cv2.VideoCapture(str(output))
     frames = []
     try:
@@ -545,7 +562,8 @@ def test_variable_crop_renders_decodable_video_with_fixed_output_dimensions(tmp_
     assert len(frames) == 10
     assert all(frame.shape == (72, 128, 3) for frame in frames)
     assert frames[0][0].mean() > 80
-    assert frames[-1][0].mean() < 8
+    assert records[-1]["crop_width"] > args.crop_width
+    assert all(frame[0].mean() > 80 and frame[-1].mean() > 80 for frame in frames)
     assert frames[-1][36].mean() > 80
 
 
@@ -595,3 +613,242 @@ def test_manual_correction_reaches_operator_target(tmp_path):
     assert result[2] == 3000.0
     assert result[0] == 1900.0
     assert result[4] == 1900.0
+
+
+def test_time_based_smoothing_matches_original_kernels_at_two_hertz():
+    from panstudio.planning import triangular_kernel
+    assert np.allclose(triangular_kernel(1.5, 2.0) * 16, [1, 2, 3, 4, 3, 2, 1])
+    assert np.allclose(triangular_kernel(1.0, 2.0) * 9, [1, 2, 3, 2, 1])
+    assert len(triangular_kernel(1.5, 5.0)) == 17
+
+
+def test_smoothing_response_is_independent_of_sample_rate():
+    """A 2 Hz and a 5 Hz analysis of the same step should settle on the same timeline."""
+    results = {}
+    for rate in (2.0, 5.0):
+        raw = np.array([1500.0] * int(10 * rate) + [2500.0] * int(10 * rate))
+        results[rate] = smooth_centers(raw, crop_width=2560, frame_width=4608, sample_rate=rate)
+    times = {rate: np.arange(len(r)) / rate for rate, r in results.items()}
+    resampled = np.interp(times[2.0], times[5.0], results[5.0])
+    assert np.max(np.abs(resampled - results[2.0])) < 100.0
+
+
+def test_frame_rate_path_is_smooth_and_never_overshoots():
+    from panstudio.media import frame_rate_path
+    records = [{"time": t / 5.0, "crop_x": 1000.0 if t < 10 else 1600.0, "crop_width": 2560.0, "crop_height": 1440.0} for t in range(20)]
+    sample_times = np.array([r["time"] for r in records])
+    frame_times = np.arange(80) / 20.0
+    xs, widths, heights = frame_rate_path(records, sample_times, frame_times, 2560, 1440)
+    assert xs.min() >= 1000.0 - 1e-9 and xs.max() <= 1600.0 + 1e-9
+    assert np.allclose(widths, 2560.0) and np.allclose(heights, 1440.0)
+    linear = np.interp(frame_times, sample_times, [r["crop_x"] for r in records])
+    # Acceleration (second difference) should be gentler than plain interpolation.
+    assert np.max(np.abs(np.diff(xs, 2))) < np.max(np.abs(np.diff(linear, 2)))
+
+
+def test_masked_weights_do_not_favor_near_sideline_players():
+    boxes = np.array([[100, 1500, 150, 1728], [2000, 950, 2015, 995]], dtype=float)  # 228 px and 45 px tall
+    confidences = np.array([0.8, 0.8])
+    mask = np.full((1728, 4608), 255, dtype=np.uint8)
+    near, far = select_field_players(boxes, confidences, 4608, mask)
+    assert near["weight"] / far["weight"] < 2.0
+    unmasked = select_field_players(np.array([[1000, 1300, 1050, 1600], [2000, 950, 2015, 1000]], dtype=float), confidences, 4608, None)
+    assert unmasked[0]["weight"] / unmasked[1]["weight"] > 5.0
+
+
+def test_track_gate_keeps_a_near_sideline_sprinter_at_five_hertz():
+    """A 250 px tall player starting a sprint moves ~230 px in 0.2 s with no velocity history."""
+    def tall(x):
+        p = player(0, x, velocity=0.0, center_y=1500.0)
+        p["height"] = 250.0
+        p.pop("track_id")
+        return p
+    records = [{"players": [tall(x)]} for x in (1000.0, 1230.0, 1460.0)]
+    suppress_stationary_tracks(records, sample_rate=5.0)
+    assert len({r["players"][0]["track_id"] for r in records}) == 1
+    # At 2 Hz the same tolerance is not extended to a 500 px jump of a small far player.
+    far = [{"players": [dict(player(0, x), height=40.0)]} for x in (1000.0, 1900.0)]
+    for r in far:
+        r["players"][0].pop("track_id")
+    suppress_stationary_tracks(far, sample_rate=2.0)
+    assert far[0]["players"][0]["track_id"] != far[1]["players"][0]["track_id"]
+
+
+def test_bystander_suppression_keeps_runners_and_demotes_loiterers_and_benches():
+    from panstudio.tracking import suppress_bystanders
+    rate = 5.0
+    records = []
+    for i in range(int(400 * rate)):  # 400 s
+        t = i / rate
+        runner = player(1, 1500 + 300 * np.sin(t / 3.0), center_y=1200.0)     # sprints back and forth, 100 px tall
+        runner["box"] = [runner["center_x"] - 20, 1100.0, runner["center_x"] + 20, 1200.0]
+        loiterer = player(2, 2500 + 8 * np.sin(t), center_y=1000.0)           # shuffles within a few px
+        loiterer["box"] = [loiterer["center_x"] - 20, 900.0, loiterer["center_x"] + 20, 1000.0]
+        seated = player(3, 3500 + 300 * np.sin(t / 3.0), center_y=1000.0)      # mobile but squat box
+        seated["box"] = [seated["center_x"] - 60, 940.0, seated["center_x"] + 60, 1000.0]
+        records.append({"time": t, "players": [runner, loiterer, seated]})
+    suppress_bystanders(records, rate, 4608, 1728)
+    mid = records[len(records) // 2]["players"]
+    assert mid[0]["weight"] == 1.0 and mid[0]["stationary_factor"] == 1.0
+    assert mid[0]["mobility"] > 2.0
+    assert mid[1]["weight"] <= 0.2 and mid[1]["occupancy"] > 0.5
+    assert mid[2]["weight"] == 0.5
+    # Early samples lack a full occupancy window but mobility still applies.
+    assert records[2]["players"][1]["weight"] <= 0.2
+
+
+def test_bystander_suppression_tolerates_broken_tracks_in_a_crowd():
+    """A crowd where the tracker swaps identities every second is still suppressed by occupancy."""
+    from panstudio.tracking import suppress_bystanders
+    rate = 5.0
+    records = []
+    for i in range(int(300 * rate)):
+        t = i / rate
+        crowd = []
+        for k in range(5):
+            p = player(100 * int(t) + k, 2400 + 60 * k + 15 * np.sin(t + k), center_y=1000.0)
+            p["box"] = [p["center_x"] - 15, 940.0, p["center_x"] + 15, 1000.0]
+            crowd.append(p)
+        records.append({"time": t, "players": crowd})
+    suppress_bystanders(records, rate, 4608, 1728)
+    assert all(p["weight"] <= 0.2 for p in records[len(records) // 2]["players"])
+
+
+def test_outline_suggestion_follows_running_and_excludes_benches():
+    """Runners inside a rectangle for seven minutes; loiterers beside it. The suggestion must cover the
+    runners' area and leave the loiterers out, with no mask or geometry provided."""
+    from panstudio.models import Detection, DetectionSample, DetectionSet, VideoInfo
+    from panstudio.suggest import suggest_outline
+    rate, seconds = 5.0, 7 * 60
+    samples = []
+    rng = np.random.default_rng(1)
+    for i in range(int(seconds * rate)):
+        t = i / rate
+        boxes = []
+        for k in range(8):   # runners sweep the rectangle x 800..3800, feet y 1050..1500
+            phase = k / 8 * 2 * np.pi
+            x = 2300 + 1450 * np.sin(t / 7.0 + phase)
+            foot = 1275 + 215 * np.sin(t / 11.0 + phase * 1.7)
+            h = 0.4 * foot - 360
+            boxes.append((x - h / 5, foot - h, x + h / 5, foot))
+        for k in range(4):   # bench: shuffling people at the bottom right, feet y 1650
+            x = 4200 + 90 * k + 10 * np.sin(t + k)
+            boxes.append((x - 40, 1650 - 300, x + 40, 1650))
+        samples.append(DetectionSample(round(t, 3), round(t, 3), tuple(Detection(b, 0.9) for b in boxes)))
+    detections = DetectionSet(VideoInfo(4608, 1728, 20.0, seconds), {'path': 'x', 'size': 1, 'mtime_ns': 1}, 0.0, float(seconds), rate,
+                              {'model': 'm', 'inference_size': 1920, 'confidence': .2, 'weights': None}, tuple(samples))
+    points, heat = suggest_outline(detections)
+    assert points is not None and heat is not None
+    polygon = np.array([[p['x'] * 4608, p['y'] * 1728] for p in points], dtype=np.float32)
+    inside = lambda x, y: cv2.pointPolygonTest(polygon, (float(x), float(y)), False) >= 0
+    assert inside(2300, 1275) and inside(1300, 1250) and inside(3300, 1300) and inside(2300, 1110) and inside(2300, 1440)
+    assert not inside(4350, 1640)   # the bench
+    assert not inside(2300, 700)    # the sky
+    assert heat[1650 // 4, 4350 // 4, 3] > 0   # the bench is marked on the heat map
+
+
+def test_flight_target_pans_to_landing_from_the_release_and_returns():
+    from panstudio.planning import annotate_flights, apply_flight_targets
+    rate = 5.0
+    records = [{"time": i / rate, "players": []} for i in range(int(30 * rate))]
+    centers = np.full(len(records), 2000.0)
+    flights = [{"start": 10.0, "end": 12.0, "x0": 2100.0, "y0": 1000.0, "x1": 3600.0, "y1": 1000.0, "direction": 1, "chord": 1500.0}]
+    annotate_flights(records, flights, 2560, 4608, 0.15)
+    assert records[int(10.5 * rate)]["flight_active"] and not records[int(5 * rate)]["flight_active"]
+    assert records[int(10.5 * rate)]["flight_target_x"] == pytest.approx(min(3600 + 0.15 * 2560, 4608 - 1280))  # look room, clipped to the frame
+    assert records[int(13.5 * rate)]["flight_active"] and not records[int(15 * rate)]["flight_active"]
+    args = Namespace(crop_width=2560, sample_rate=rate, frame_width=4608)
+    result = apply_flight_targets(args, records, centers)
+    assert result[int(13.0 * rate)] == pytest.approx(3328.0)          # clipped to the right edge, on the landing
+    assert np.all(result[:int(10.0 * rate)] == pytest.approx(2000.0))  # nothing moves before the release
+    assert result[int(10.0 * rate)] > 2000.0                                   # and the pan starts right after it
+    assert np.all(np.abs(np.diff(result)) <= 570 / rate + 1e-6)        # within the deep pan speed
+    assert result[-1] == pytest.approx(2000.0)                         # back on the formation afterwards
+    # A flight first found mid-air (a high pull) had its release out of view: the camera may start early.
+    pull = [{"time": i / rate, "players": []} for i in range(int(30 * rate))]
+    annotate_flights(pull, [{**flights[0], "launch_seen": False}], 2560, 4608, 0.15)
+    assert apply_flight_targets(args, pull, centers)[int(9.0 * rate)] > 2000.0
+    # Receivers still running the throw's way after the hold keep the camera from falling back behind them.
+    for record in records[int(14.2 * rate):int(17 * rate)]:
+        record.update({"deep_active": True, "deep_direction": 1, "deep_leading_x": 4000.0})
+    held = apply_flight_targets(args, records, centers)
+    assert np.all(held[int(14.2 * rate):int(17 * rate)] >= 4000 + 0.1 * 2560 - 1280 - 1e-6)
+    assert held[-1] == pytest.approx(2000.0)
+    # A short throw never moves the camera, whether measured in pixels or in body heights.
+    short = [{"time": i / rate, "players": []} for i in range(int(30 * rate))]
+    annotate_flights(short, [{**flights[0], "chord": 300.0}], 2560, 4608, 0.15)
+    assert not any(r["flight_active"] for r in short)
+    annotate_flights(short, [{**flights[0], "chord_bodies": 5.0}], 2560, 4608, 0.15)
+    assert not any(r["flight_active"] for r in short)
+    # A far-sideline huck covers few pixels but many body heights.
+    annotate_flights(short, [{**flights[0], "chord": 700.0, "chord_bodies": 16.0}], 2560, 4608, 0.15)
+    assert any(r["flight_active"] for r in short)
+
+
+def test_flight_widening_holds_both_ends_when_possible():
+    records = [{"time": i / 5.0, "flight_active": i == 25, "flight_min_x": 800.0, "flight_max_x": 3400.0} for i in range(50)]
+    widths = plan_crop_widths(Namespace(crop_width=2560, crop_height=1440, sample_rate=5.0, no_auto_widen=False, no_deep_tracking=False),
+                              records, np.full(50, 2100.0), 4608, 1728)
+    assert widths[25] > 2560 and widths[25] <= 2560 * 1.15 + 1e-6
+
+
+def test_flight_qualification_accepts_a_smooth_arc_and_rejects_chained_clutter():
+    from panstudio.disc import _qualify
+    from panstudio.models import Detection, DetectionSample, DetectionSet, VideoInfo
+    samples = tuple(DetectionSample(t / 5, t / 5, (Detection((2000.0, 1100.0, 2060.0, 1250.0), .9), Detection((3500.0, 1050.0, 3550.0, 1180.0), .9))) for t in range(60))
+    detections = DetectionSet(VideoInfo(4608, 1728, 20.0, 12.0), {'path': 'x', 'size': 1, 'mtime_ns': 1}, 0.0, 12.0, 5.0,
+                              {'model': 'm', 'inference_size': 1920, 'confidence': .2, 'weights': None}, samples)
+    # A smooth parabola from the first player to the second, 40 frames, blobs of ~20 px.
+    arc = [(f, 2030 + (3525 - 2030) * f / 40, 1100 - 300 * np.sin(np.pi * f / 40), 300) for f in range(41)]
+    # Chained clutter: fast, straight, but tiny blobs jumping 150 px a frame along the far edge.
+    chain = [(f, 500 + 150 * f, 950 + 2 * f, 8) for f in range(20)]
+    mask = np.zeros((1728, 4608), np.uint8); mask[1000:1700, 200:4400] = 255
+    tops = np.full(4608, 1000, dtype=np.int32)
+    flights = _qualify([{'points': arc}, {'points': chain}], detections, 20.0, 0.0, mask, tops)
+    assert len(flights) == 1 and flights[0].direction == 1 and flights[0].x1 == pytest.approx(3525.0)
+
+
+def test_flight_qualification_accepts_a_low_far_sideline_arc_but_not_traffic():
+    from panstudio.disc import _qualify
+    from panstudio.models import Detection, DetectionSample, DetectionSet, VideoInfo
+    samples = tuple(DetectionSample(t / 5, t / 5, (Detection((2620.0, 900.0, 2650.0, 970.0), .9), Detection((3830.0, 905.0, 3860.0, 975.0), .9))) for t in range(60))
+    detections = DetectionSet(VideoInfo(4608, 1728, 20.0, 12.0), {'path': 'x', 'size': 1, 'mtime_ns': 1}, 0.0, 12.0, 5.0,
+                              {'model': 'm', 'inference_size': 1920, 'confidence': .2, 'weights': None}, samples)
+    mask = np.zeros((1728, 4608), np.uint8); mask[970:1700, 200:4400] = 255
+    tops = np.full(4608, 970, dtype=np.int32)
+    # A huck seen along the far sideline: 1200 px long but arching only ~90 px, as at 5:29 in the field footage.
+    arc = [(f, 2650 + 1200 * f / 48, 968 - 90 * np.sin(np.pi * f / 48), 80) for f in range(49)]
+    # A car on the road behind the far sideline: the same speed and length, but level.
+    car = [(f, 2650 + 1200 * f / 48, 960 - 0.2 * f, 80) for f in range(49)]
+    assert len(_qualify([{'points': arc}], detections, 20.0, 0.0, mask, tops)) == 1
+    assert _qualify([{'points': car}], detections, 20.0, 0.0, mask, tops) == []
+
+
+def test_single_sample_protection_flicker_does_not_yank_the_camera():
+    """A deep pair runs right. One far-left detection appears for a single sample; the camera must not dip."""
+    rate = 5.0
+    records = []
+    for i in range(int(8 * rate)):
+        players = [player(1, 3300 + 40 * i), player(2, 3350 + 40 * i)]
+        for k in range(3, 9):
+            players.append(player(k, 2600 + 60 * k, velocity=0.0))
+        if i == 20:
+            players.append(player(99, 1700.0, velocity=0.0))   # the flicker
+        records.append({"players": players, "deep_active": True, "deep_track_ids": [1, 2], "deep_direction": 1,
+                        "deep_pair_min_x": 3300 + 40 * i, "deep_pair_max_x": 3350 + 40 * i,
+                        "deep_center_x": 3325 + 40 * i, "deep_leading_x": 3350 + 40 * i, "deep_velocity_x": 200.0})
+    centers = np.full(len(records), 2900.0)
+    args = Namespace(no_deep_tracking=False, crop_width=2560, sample_rate=rate, deep_lookahead=0.6, frame_width=4608)
+    result = apply_deep_coverage(args, records, centers)
+    steps = np.diff(result)
+    # No reversal against the pan direction around the flicker.
+    assert np.all(steps[15:25] >= -1e-6)
+
+
+def test_ease_path_rounds_corners_without_delay_or_overshoot():
+    from panstudio.planning import ease_path
+    path = np.array([1000.0] * 20 + [1000 + 100 * i for i in range(1, 11)] + [2000.0] * 20)
+    eased = ease_path(path, 5.0)
+    assert eased.min() >= 1000 - 1e-9 and eased.max() <= 2000 + 1e-9
+    assert np.max(np.abs(np.diff(eased, 2))) < np.max(np.abs(np.diff(path, 2)))
+    assert abs(eased[25] - path[25]) < 1e-6   # mid-pan is untouched: zero phase

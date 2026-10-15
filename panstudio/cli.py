@@ -23,6 +23,7 @@ def parse_args(argv=None):
     parser.add_argument("--start", type=float, required=True)
     parser.add_argument("--end", type=float, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("prototype/output"))
+    parser.add_argument("--output-name", default="tactical-crop", help="File name for the tactical video (.mp4 is added)")
     parser.add_argument("--model", default="yolo11s.pt")
     parser.add_argument("--sample-rate", type=float, default=5.0)
     parser.add_argument("--inference-size", type=int, default=1920)

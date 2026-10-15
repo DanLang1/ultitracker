@@ -114,7 +114,10 @@ def plan_camera(config: ProcessingConfig, detections: DetectionSet, mask=None, f
     centers = smooth_centers(raw, args.crop_width, video.width, args.sample_rate, calibration)
     centers = apply_deep_coverage(args, records, centers)
     if flights and not config.no_disc_tracking:
-        annotate_flights(records, flights, args.crop_width, video.width, args.look_room)
+        ignored = annotate_flights(records, flights, args.crop_width, video.width, args.look_room)
+        if ignored:
+            report('planning', 0, 1, f'Ignored {len(ignored)} long flights that moved with a runner: '
+                   + ', '.join(f"{int(f['start'] // 60)}:{f['start'] % 60:04.1f}" for f in ignored))
         centers = apply_flight_targets(args, records, centers)
     times = np.array([record['time'] for record in records])
     centers = apply_disc_anchors(args, times, centers)
@@ -131,4 +134,4 @@ def render_plan(config: ProcessingConfig, plan: CameraPlan):
     args = replace(config, crop_width=plan.crop_width, crop_height=plan.crop_height)
     if args.debug:
         render(args, list(plan.samples), video.width, video.height, video.fps, args.output_dir / 'debug-wide.mp4', True)
-    render(args, list(plan.samples), video.width, video.height, video.fps, args.output_dir / 'tactical-crop.mp4', False)
+    render(args, list(plan.samples), video.width, video.height, video.fps, args.output_dir / f'{args.output_name}.mp4', False)

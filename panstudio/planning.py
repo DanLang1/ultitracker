@@ -163,34 +163,73 @@ FLIGHT_MIN_BODIES = 12.0        # chord in body heights (about 20 m); shorter th
 FLIGHT_MIN_CHORD_SHARE = 0.2    # fallback, of the frame width, for flights without a body-scaled length
 FLIGHT_HOLD_SECONDS = 2.0       # stay on the landing after the catch
 FLIGHT_FOLLOW_MARGIN = 0.1      # crop-width share kept ahead of receivers still running the throw's way
+FLIGHT_ESCORT_SHARE = 0.6       # a "flight" with a player alongside at its speed this much of the time is that player
+FLIGHT_ESCORT_REACH = 1.5       # body heights between the flight and the player running with it
+FLIGHT_ESCORT_MIN_SPEED = 150.0 # px/s across the frame; slower stretches say nothing (standing players match them)
 
 
-def annotate_flights(records: list[Sample], flights, crop_width: float, frame_width: int, look_room: float):
+def _escorted(records: list[Sample], times: np.ndarray, flight) -> bool:
+    """Whether a player runs alongside the flight at its speed for most of it.
+
+    A disc outruns everyone until it is caught. A sprinter's bobbing head or
+    hand, left outside a lagging person box, moves with the sprinter: a long,
+    smooth, plausible "flight" that would drag the camera after one runner.
+    """
+    points = np.asarray(flight.get("points") or [], dtype=float)
+    if len(points) < 2:
+        return False
+    first, last = np.searchsorted(times, points[0, 0]), np.searchsorted(times, points[-1, 0], side="right")
+    escorted = checked = 0
+    for record in records[first:last]:
+        t = record["time"]
+        x, y = np.interp(t, points[:, 0], points[:, 1]), np.interp(t, points[:, 0], points[:, 2])
+        k = int(np.searchsorted(points[:, 0], t))
+        a, b = max(0, k - 3), min(len(points) - 1, k + 3)
+        velocity = (points[b, 1] - points[a, 1]) / max(1e-3, points[b, 0] - points[a, 0])
+        if abs(velocity) < FLIGHT_ESCORT_MIN_SPEED:
+            continue
+        checked += 1
+        for player in record.get("players", []):
+            reach = FLIGHT_ESCORT_REACH * float(player.get("height", 100.0))
+            if abs(player["center_x"] - x) <= reach and abs(player["center_y"] - y) <= reach \
+                    and abs(player.get("velocity_x", 0.0) - velocity) <= max(60.0, 0.35 * abs(velocity)):
+                escorted += 1
+                break
+    return checked > 0 and escorted / checked >= FLIGHT_ESCORT_SHARE
+
+
+def annotate_flights(records: list[Sample], flights, crop_width: float, frame_width: int, look_room: float) -> list:
     """Mark the samples each long disc flight governs and what they should show.
 
     A flight is a dictionary with start, end, x0, y0, x1, y1, chord and
     direction. The camera target is the landing point plus look room in the
     throw direction. Later flights override earlier overlapping ones.
+    Returns the long flights ignored because a runner moved with them.
     """
     half = crop_width / 2
+    times = np.array([record["time"] for record in records])
     for record in records:
         record["flight_active"] = False
+    escorted = []
     for flight in sorted(flights, key=lambda f: f["start"]):
         bodies = flight.get("chord_bodies")
         if (bodies is not None and bodies > 0 and bodies < FLIGHT_MIN_BODIES) or (not bodies and flight["chord"] < FLIGHT_MIN_CHORD_SHARE * frame_width):
             continue
+        if _escorted(records, times, flight):
+            escorted.append(flight)
+            continue
         direction = 1 if flight["direction"] >= 0 else -1
         target = float(np.clip(flight["x1"] + direction * look_room * crop_width, half, frame_width - half))
         low, high = flight["start"], flight["end"] + FLIGHT_HOLD_SECONDS
-        for record in records:
-            if low <= record["time"] <= high:
-                record.update({
-                    "flight_active": True, "flight_direction": direction, "flight_target_x": round(target, 2),
-                    "flight_min_x": round(min(flight["x0"], flight["x1"]), 2), "flight_max_x": round(max(flight["x0"], flight["x1"]), 2),
-                    "flight_x0": round(float(flight["x0"]), 1), "flight_y0": round(float(flight["y0"]), 1),
-                    "flight_x1": round(float(flight["x1"]), 1), "flight_y1": round(float(flight["y1"]), 1),
-                    "flight_start": float(flight["start"]), "flight_launch_seen": bool(flight.get("launch_seen", True)),
-                })
+        for record in records[np.searchsorted(times, low):np.searchsorted(times, high, side="right")]:
+            record.update({
+                "flight_active": True, "flight_direction": direction, "flight_target_x": round(target, 2),
+                "flight_min_x": round(min(flight["x0"], flight["x1"]), 2), "flight_max_x": round(max(flight["x0"], flight["x1"]), 2),
+                "flight_x0": round(float(flight["x0"]), 1), "flight_y0": round(float(flight["y0"]), 1),
+                "flight_x1": round(float(flight["x1"]), 1), "flight_y1": round(float(flight["y1"]), 1),
+                "flight_start": float(flight["start"]), "flight_launch_seen": bool(flight.get("launch_seen", True)),
+            })
+    return escorted
 
 
 def apply_flight_targets(args: ProcessingConfig, records: list[Sample], centers: np.ndarray) -> np.ndarray:
@@ -257,13 +296,19 @@ def plan_crop_widths(args: ProcessingConfig, records: list[Sample], centers: np.
     for i, record in enumerate(records):
         spans = []
         if record.get("deep_active"):
+            # A cutter who has beaten their defender gets room ahead: that is
+            # where the throw to them lands.
+            ahead = calibration.deep_margin if record.get("deep_breakaway") else calibration.widening_margin
+            direction = record.get("deep_direction", 0)
             spans.append((float(record.get("deep_pair_min_x", record.get("deep_center_x", 0))),
-                          float(record.get("deep_pair_max_x", record.get("deep_center_x", 0)))))
+                          float(record.get("deep_pair_max_x", record.get("deep_center_x", 0))),
+                          ahead if direction < 0 else calibration.widening_margin,
+                          ahead if direction > 0 else calibration.widening_margin))
         if record.get("flight_active"):
-            spans.append((float(record["flight_min_x"]), float(record["flight_max_x"])))
-        for span_min, span_max in spans:
-            pair_min = np.clip(span_min - calibration.widening_margin, 0, source_width)
-            pair_max = np.clip(span_max + calibration.widening_margin, 0, source_width)
+            spans.append((float(record["flight_min_x"]), float(record["flight_max_x"]), calibration.widening_margin, calibration.widening_margin))
+        for span_min, span_max, left_margin, right_margin in spans:
+            pair_min = np.clip(span_min - left_margin, 0, source_width)
+            pair_max = np.clip(span_max + right_margin, 0, source_width)
             center = float(np.clip(centers[i], 0, source_width))
             # Expansion stays centered until it reaches a source edge. After
             # that, the opposite edge advances by the full added width.

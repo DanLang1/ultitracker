@@ -1,4 +1,4 @@
-const state = { jobId: null, metadata: null, frame: null, strokes: [], drawing: false, pollToken: 0, heat: null, showHeat: true, analysisTimer: null, awaitingProcess: false };
+const state = { jobId: null, metadata: null, frame: null, strokes: [], drawing: false, pollToken: 0 };
 
 const $ = (selector) => document.querySelector(selector);
 const panels = [...document.querySelectorAll('.panel')];
@@ -64,8 +64,6 @@ function loadCanvasFrame(url) {
     updateOutlineActions();
     renderCanvas();
     showStep(2);
-    applyAnalysis(state.metadata.analysis);
-    watchAnalysis();
   };
   image.onerror = () => { $('#jobs-error').textContent = 'Could not load the saved video frame.'; };
   image.src = `${url}?v=${Date.now()}`;
@@ -83,7 +81,6 @@ function renderCanvas() {
   if (!state.frame) return;
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.drawImage(state.frame, 0, 0, canvas.width, canvas.height);
-  if (state.showHeat && state.heat) context.drawImage(state.heat, 0, 0, canvas.width, canvas.height);
   const points = state.strokes.flat();
   if (points.length < 2) return;
   context.save();
@@ -107,92 +104,6 @@ function updateOutlineActions() {
   $('#clear-outline').disabled = state.strokes.length === 0;
   $('#generate-preview').disabled = state.drawing || pointCount < 3;
 }
-
-function suggestionStroke() {
-  const points = state.metadata && state.metadata.analysis && state.metadata.analysis.points;
-  if (!points || points.length < 3) return null;
-  return points.map(point => ({ x: point.x * canvas.width, y: point.y * canvas.height }));
-}
-
-function applyAnalysis(analysis) {
-  const status = $('#analysis-status');
-  const useButton = $('#use-suggestion');
-  if (state.metadata) state.metadata.analysis = analysis;
-  state.heat = null;
-  useButton.disabled = true;
-  $('#run-analysis').classList.toggle('hidden', !(!analysis || ['none', 'failed'].includes(analysis.state)));
-  if (!analysis || analysis.state === 'none') {
-    status.textContent = 'Player analysis has not run yet. Draw the outline by hand.';
-  } else if (analysis.state === 'running') {
-    status.textContent = `Analyzing players… ${analysis.progress || 0}%. A suggested outline will appear here; you can draw meanwhile.`;
-  } else if (analysis.state === 'failed') {
-    status.textContent = `Player analysis failed: ${analysis.message || 'see the job log'}. Draw the outline by hand.`;
-  } else if (analysis.points) {
-    status.textContent = `Suggested outline ready from ${analysis.minutes || '?'} minutes of play. Red shows where people usually stand; keep benches outside.`;
-    useButton.disabled = false;
-    if (state.strokes.length === 0) {
-      state.strokes = [suggestionStroke()];
-      updateOutlineActions();
-    }
-  } else {
-    status.textContent = 'Recording too short for an outline suggestion. Draw the outline by hand.';
-  }
-  if (analysis && analysis.heat_url) {
-    const image = new Image();
-    image.onload = () => { state.heat = image; renderCanvas(); };
-    image.src = `${analysis.heat_url}?v=${Date.now()}`;
-  }
-  renderCanvas();
-}
-
-function watchAnalysis() {
-  clearTimeout(state.analysisTimer);
-  const analysis = state.metadata && state.metadata.analysis;
-  if (!analysis || analysis.state !== 'running') return;
-  const jobId = state.jobId;
-  state.analysisTimer = setTimeout(async () => {
-    if (state.jobId !== jobId) return;
-    try {
-      const response = await fetch(`/api/jobs/${jobId}`);
-      const job = await response.json();
-      if (!response.ok || state.jobId !== jobId) return;
-      state.metadata.awaiting_process = job.awaiting_process;
-      if (job.analysis.state !== 'running' || job.analysis.progress !== analysis.progress) applyAnalysis(job.analysis);
-      watchAnalysis();
-    } catch (error) {
-      watchAnalysis();
-    }
-  }, 2500);
-}
-
-$('#run-analysis').addEventListener('click', async () => {
-  $('#run-analysis').disabled = true;
-  $('#outline-error').textContent = '';
-  try {
-    const response = await fetch(`/api/analyze/${state.jobId}`, { method: 'POST' });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || 'Could not start the player analysis.');
-    applyAnalysis({ state: 'running', progress: result.progress || 0 });
-    watchAnalysis();
-  } catch (error) {
-    $('#outline-error').textContent = error.message;
-  } finally {
-    $('#run-analysis').disabled = false;
-  }
-});
-
-$('#use-suggestion').addEventListener('click', () => {
-  const stroke = suggestionStroke();
-  if (!stroke) return;
-  state.strokes = [stroke];
-  updateOutlineActions();
-  renderCanvas();
-});
-
-$('#heat-toggle').addEventListener('change', (event) => {
-  state.showHeat = event.target.checked;
-  renderCanvas();
-});
 
 canvas.addEventListener('pointerdown', (event) => {
   canvas.setPointerCapture(event.pointerId);
@@ -295,8 +206,6 @@ $('#process-button').addEventListener('click', async () => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not start processing.');
-    state.awaitingProcess = result.mode === 'analyze';
-    $('#process-hint').textContent = '';
     $('#process-ready').classList.add('hidden');
     $('#process-running').classList.remove('hidden');
     pollStatus(++state.pollToken);
@@ -313,20 +222,16 @@ async function pollStatus(token) {
     const result = await response.json();
     if (token !== state.pollToken) return;
     if (!response.ok) throw new Error(result.error || 'Could not read job status.');
-    const analyzing = result.mode === 'analyze';
-    $('#process-bar').style.width = `${analyzing ? Math.round((result.progress || 0) / 4) : result.progress || 0}%`;
-    $('#process-percent').textContent = `${analyzing ? Math.round((result.progress || 0) / 4) : result.progress || 0}%`;
-    $('#process-message').textContent = analyzing ? `${result.message || 'Analyzing players…'} The video will be processed next.` : (result.message || 'Processing…');
-    if (result.state === 'analyzed' && !state.awaitingProcess) {
-      $('#process-running').classList.add('hidden');
-      $('#process-ready').classList.remove('hidden');
-      return;
-    }
+    $('#process-bar').style.width = `${result.progress || 0}%`;
+    $('#process-percent').textContent = `${result.progress || 0}%`;
+    $('#process-message').textContent = result.message || 'Processing…';
     if (result.state === 'complete') {
       $('#process-running').classList.add('hidden');
       $('#process-complete').classList.remove('hidden');
       $('#output-video').src = result.output_url;
-      $('#output-download').href = `${result.output_url}?download=1`;
+      state.outputUrl = result.output_url;
+      if (!$('#output-name').value) $('#output-name').value = defaultOutputName();
+      updateOutputDownload();
       if (result.debug_url) {
         $('#debug-download').href = `${result.debug_url}?download=1`;
         $('#debug-download').classList.remove('hidden');
@@ -379,10 +284,25 @@ const dropZone = $('#drop-zone');
 dropZone.addEventListener('drop', (event) => uploadVideo(event.dataTransfer.files[0]));
 
 
+function defaultOutputName() {
+  const stem = (state.metadata?.filename || 'game').replace(/\.[^.]+$/, '');
+  return `${stem}-tactical`;
+}
+
+function updateOutputDownload() {
+  if (!state.outputUrl) return;
+  const name = $('#output-name').value.trim().replace(/\.mp4$/i, '') || defaultOutputName();
+  $('#output-download').href = `${state.outputUrl}?download=1&name=${encodeURIComponent(name)}.mp4`;
+}
+
+$('#output-name').addEventListener('input', updateOutputDownload);
+
 function selectJob(job) {
   state.pollToken += 1;
   state.jobId = job.job_id;
   state.metadata = job;
+  state.outputUrl = null;
+  $('#output-name').value = '';
   history.replaceState(null, '', `?job=${job.job_id}`);
   $('#video-facts').textContent = `${job.width} × ${job.height} · ${formatDuration(job.duration)} · ${formatSize(job.size)}`;
   $('#process-filename').textContent = job.filename;
@@ -392,11 +312,6 @@ function selectJob(job) {
   $('#process-running').classList.add('hidden');
   $('#process-complete').classList.add('hidden');
   $('#process-error').textContent = '';
-  state.awaitingProcess = Boolean(job.awaiting_process);
-  const analysis = job.analysis || {};
-  $('#process-hint').textContent = analysis.state === 'running'
-    ? 'Player analysis is still running. Processing will start automatically when it finishes.'
-    : '';
 }
 
 async function openJob(jobId) {
@@ -409,12 +324,11 @@ async function openJob(jobId) {
       loadCanvasFrame(job.frame_url);
     } else {
       showStep(4);
-      const analyzingOnly = job.status.mode === 'analyze' && !job.awaiting_process;
-      if (['queued', 'processing', 'complete'].includes(job.status.state) && !analyzingOnly) {
+      if (['queued', 'processing', 'complete'].includes(job.status.state)) {
         $('#process-ready').classList.add('hidden');
         $('#process-running').classList.remove('hidden');
         pollStatus(state.pollToken);
-      } else if (['failed', 'interrupted'].includes(job.status.state) && job.status.mode !== 'analyze') {
+      } else if (['failed', 'interrupted'].includes(job.status.state)) {
         $('#process-error').textContent = job.status.error || job.status.message;
       }
     }
@@ -445,7 +359,6 @@ async function loadJobs() {
 
 $('#choose-another').addEventListener('click', () => {
   state.pollToken += 1;
-  clearTimeout(state.analysisTimer);
   history.replaceState(null, '', '/');
   showStep(1);
   loadJobs();

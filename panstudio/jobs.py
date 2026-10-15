@@ -10,11 +10,8 @@ import threading
 import time
 from typing import Literal
 
-JobState = Literal['ready', 'queued', 'processing', 'analyzed', 'complete', 'failed', 'interrupted']
+JobState = Literal['ready', 'queued', 'processing', 'complete', 'failed', 'interrupted']
 BUSY = {'queued', 'processing'}
-# A run is either the player analysis that follows an upload (detections plus
-# an outline suggestion) or the full processing of a tactical video.
-MODES = ('analyze', 'process')
 
 
 class JobConflict(ValueError):
@@ -92,18 +89,10 @@ class JobStore:
             job = self.get(job_id)
             if job.status['state'] in BUSY:
                 return False
-            mode = settings.get('mode', 'process')
-            if mode not in MODES:
-                raise ValueError('Unknown run mode')
             metadata = {**job.metadata, **settings, 'previous_run_id': job.metadata.get('run_id'), 'run_id': run_id}
-            self.save(job_id, metadata=metadata, status={'state': 'queued', 'progress': 0, 'mode': mode,
+            self.save(job_id, metadata=metadata, status={'state': 'queued', 'progress': 0,
                                                          'message': 'Waiting for the processor…'})
             return True
-
-    def analysis_busy(self, job_id: str) -> bool:
-        """True while a player-analysis run owns the job; the mask may still change."""
-        status = self.get(job_id).status
-        return status['state'] in BUSY and status.get('mode') == 'analyze'
 
     def transition(self, job_id: str, run_id: str, state: JobState, **changes):
         with self.lock:
@@ -111,7 +100,7 @@ class JobStore:
             if job.metadata.get('run_id') != run_id:
                 return False
             allowed = {'queued': {'processing', 'failed', 'interrupted'},
-                       'processing': {'processing', 'analyzed', 'complete', 'failed', 'interrupted'}}
+                       'processing': {'processing', 'complete', 'failed', 'interrupted'}}
             if state not in allowed.get(job.status['state'], set()):
                 return False
             self.save(job_id, status={**job.status, **changes, 'state': state})
@@ -142,6 +131,9 @@ class JobStore:
                     except (ValueError, TypeError):
                         continue
             for job in self.list():
-                if job.status['state'] in BUSY:
+                if job.status.get('mode') == 'analyze' and job.status['state'] not in BUSY:
+                    # Left by the removed upload-time player analysis: the job never processed.
+                    self.save(job.id, status={'state': 'ready', 'progress': 0, 'message': 'Review the active area, then process.'})
+                elif job.status['state'] in BUSY:
                     self.save(job.id, status={'state': 'interrupted', 'progress': 0,
                                              'message': 'Processing was interrupted. You can retry this job.'})

@@ -199,3 +199,12 @@ def test_unversioned_flights_still_load_but_count_as_stale(tmp_path):
     assert flights_version(tmp_path / 'missing.json') is None
     path.write_text('not json')
     assert flights_version(path) is None
+
+
+def test_output_name_is_a_plain_file_name():
+    from panstudio.models import ProcessingConfig
+    assert ProcessingConfig(Path('game.mp4'), 0, 10).output_name == 'tactical-crop'
+    assert ProcessingConfig(Path('game.mp4'), 0, 10, output_name='vs-dynasty.mp4').output_name == 'vs-dynasty'
+    for bad in ('', '../escape', 'a/b', 'debug-wide', '.mp4'):
+        with pytest.raises(ValueError):
+            ProcessingConfig(Path('game.mp4'), 0, 10, output_name=bad)

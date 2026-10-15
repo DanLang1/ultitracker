@@ -15,17 +15,12 @@ uv run python gui.py
 
 The browser opens Tactical Pan Studio on this computer. The four steps are:
 
-1. Select the source game video. Player detection starts in the background
-   immediately and is cached for the processing step.
-2. Outline the active playing area. Once the analysis finishes (about ten
-   minutes per hour of footage on an Apple GPU), the step offers a suggested
-   outline built from where people actually run, and shades the places where
-   people usually stand (benches, tent lines) in red. Use the suggestion as is,
-   adjust it, or draw your own; the analysis does not depend on the outline.
+1. Select the source game video.
+2. Draw an outline around the active playing area.
 3. Approve the red/green mask preview.
-4. Process, preview, and save the finished 2560x1440 video. Pressing Process
-   while the analysis is still running queues the render to start as soon as
-   it finishes.
+4. Process, preview, and save the finished 2560x1440 video. Player detection
+   runs first (about twenty minutes per hour of footage on an Apple GPU) and is
+   cached, so processing the same job again with a new outline skips it.
 
 Uploaded working copies and generated files are stored under `gui_jobs/`, which
 is excluded from git. Processing continues locally while the server is running, even if the browser tab closes.
@@ -67,7 +62,10 @@ uv run python tactical_pan.py vssdynasty.mp4 \
 ```
 
 When `--debug` is supplied, `debug-wide.mp4` shows retained detections and the
-smoothed crop. Without it, only the faster `tactical-crop.mp4` render is created.
+smoothed crop. Without it, only the faster `tactical-crop.mp4` render is created;
+`--output-name vs-dynasty` names it `vs-dynasty.mp4` instead. In the GUI, the
+**Save as** field next to **Save tactical video** sets the downloaded file's name
+(it defaults to the source video's name plus `-tactical`).
 The crop decisions are also saved as `pan-path.csv` and `analysis.json`.
 
 Player analysis samples the source at 5 Hz by default (`--sample-rate`). Every
@@ -169,6 +167,10 @@ does not cut those players out; when both goals cannot fit, formation coverage
 is preferred and the optional deep margin is reduced. Use `--deep-lookahead` to
 tune the forward projection (the default is 0.6 seconds), or
 `--no-deep-tracking` to compare against formation-only framing.
+When a cutter beats their defender and pulls clear of the pair, a new pair
+forms behind them; the cutter stays tracked for as long as they keep sprinting
+ahead of it, and the crop widens to leave room in front of them, which is where
+a throw to them lands.
 For an A/B run that favors deep-pair coverage when the two objectives compete,
 use `--no-formation-protection`. A mask that includes sideline spectators can
 cause formation protection to favor those spectators too; exclude them when

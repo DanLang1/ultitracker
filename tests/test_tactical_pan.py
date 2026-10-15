@@ -182,6 +182,71 @@ def test_deep_preroll_is_limited_to_half_a_second():
     assert records[3]["deep_active"]
 
 
+def test_deep_cutter_who_beats_their_defender_stays_tracked():
+    # Cutter 1 and defender 2 run deep together, then the cutter pulls clear (beyond the pair gap)
+    # and the defender pairs up with a trailing player 3 instead.
+    records = [
+        {"raw_center_x": 1000.0, "players": [player(1, 1500), player(2, 1400)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 1700), player(2, 1550)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 2200), player(2, 1650), player(3, 1600)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 2500), player(2, 1750), player(3, 1700)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 2520, velocity=0.0), player(2, 1850), player(3, 1800)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 2520, velocity=0.0), player(2, 1950), player(3, 1900)]},
+    ]
+
+    identify_deep_pairs(records, sample_rate=2.0)
+
+    assert records[1]["deep_track_ids"] == [1, 2] and not records[1]["deep_breakaway"]
+    assert sorted(records[3]["deep_track_ids"]) == [1, 2, 3] and records[3]["deep_breakaway"]
+    assert records[3]["deep_leading_x"] == pytest.approx(2500.0)
+    # Once the cutter stops running, the pair behind is tracked on its own again.
+    assert sorted(records[5]["deep_track_ids"]) == [2, 3] and not records[5]["deep_breakaway"]
+
+
+def test_breakaway_is_not_inherited_by_an_unrelated_pair():
+    # The cutter's pair ends (the defender stops); a separate pair 4 and 5 starts a cut elsewhere.
+    records = [
+        {"raw_center_x": 1000.0, "players": [player(1, 1500), player(2, 1400)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 1700), player(2, 1550)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 2200), player(2, 1600, velocity=0.0), player(4, 1350), player(5, 1300)]},
+        {"raw_center_x": 1000.0, "players": [player(1, 2500), player(2, 1600, velocity=0.0), player(4, 1450), player(5, 1400)]},
+    ]
+
+    identify_deep_pairs(records, sample_rate=2.0)
+
+    assert sorted(records[3]["deep_track_ids"]) == [4, 5] and not records[3]["deep_breakaway"]
+
+
+def test_deep_coverage_keeps_a_breakaway_cutter_and_the_pair_behind_in_frame():
+    records = [
+        {"raw_center_x": 1300.0, "players": [player(1, 1800), player(2, 1700), player(9, 1100, velocity=0.0)]},
+        {"raw_center_x": 1300.0, "players": [player(1, 2000), player(2, 1850), player(9, 1100, velocity=0.0)]},
+        {"raw_center_x": 1300.0, "players": [player(1, 2500), player(2, 1950), player(3, 1900), player(9, 1100, velocity=0.0)]},
+        {"raw_center_x": 1300.0, "players": [player(1, 2800), player(2, 2050), player(3, 2000), player(9, 1100, velocity=0.0)]},
+        {"raw_center_x": 1300.0, "players": [player(1, 3000), player(2, 2150), player(3, 2100), player(9, 1100, velocity=0.0)]},
+    ]
+    identify_deep_pairs(records, sample_rate=2.0)
+    assert records[-1]["deep_breakaway"] and len(records[-1]["deep_track_ids"]) == 3
+    args = Namespace(no_deep_tracking=False, crop_width=2560, sample_rate=2.0, deep_lookahead=0.6, frame_width=4608)
+
+    result = apply_deep_coverage(args, records, np.full(len(records), 1300.0))
+
+    left, right = result[-1] - 1280, result[-1] + 1280
+    assert right >= 3000                                   # the cutter who got away
+    assert left <= 1100                                    # the formation player behind is not cut
+
+
+def test_breakaway_widens_with_room_ahead_of_the_cutter():
+    args = Namespace(crop_width=2560, crop_height=1440, sample_rate=5.0, no_auto_widen=False, no_deep_tracking=False)
+    deep = {"time": 0.0, "deep_active": True, "deep_direction": 1, "deep_pair_min_x": 3000.0, "deep_pair_max_x": 3600.0}
+    centers = np.full(30, 2300.0)
+    pair = plan_crop_widths(args, [dict(deep, time=i / 5.0) for i in range(30)], centers, 4608, 1728)
+    breakaway = plan_crop_widths(args, [dict(deep, time=i / 5.0, deep_breakaway=True) for i in range(30)], centers, 4608, 1728)
+    assert pair[15] == pytest.approx(2 * (3600 + 40 - 2300))
+    assert breakaway[15] == pytest.approx(2560 * 1.15)  # room ahead of the cutter, up to the cap
+    assert breakaway[15] > pair[15]
+
+
 def test_deep_pair_survives_dropout_with_predicted_leading_edge():
     records = [
         {"raw_center_x": 1000.0, "players": [player(1, 1400), player(2, 1500)]},
@@ -783,6 +848,33 @@ def test_flight_target_pans_to_landing_from_the_release_and_returns():
     # A far-sideline huck covers few pixels but many body heights.
     annotate_flights(short, [{**flights[0], "chord": 700.0, "chord_bodies": 16.0}], 2560, 4608, 0.15)
     assert any(r["flight_active"] for r in short)
+
+
+def test_flight_with_a_runner_alongside_is_ignored():
+    """A sprinter's bobbing head can look like a long flight; a real disc outruns everyone."""
+    from panstudio.planning import annotate_flights
+    rate = 5.0
+    flight = {"start": 10.0, "end": 12.0, "x0": 800.0, "y0": 1080.0, "x1": 1500.0, "y1": 1180.0, "direction": 1,
+              "chord": 700.0, "chord_bodies": 20.0,
+              "points": [[10.0 + i / 20, 800.0 + 17.5 * i, 1080.0 + 2.5 * i] for i in range(41)]}
+    def records(runner_offset):
+        return [{"time": i / rate, "players": [{"track_id": 7, "center_x": 800.0 + 350.0 * (i / rate - 10.0) + runner_offset,
+                                               "center_y": 1180.0, "height": 200.0, "velocity_x": 350.0}]}
+                for i in range(int(20 * rate))]
+    escorted = records(80.0)        # the runner a step ahead of the "disc", at its speed
+    assert annotate_flights(escorted, [flight], 2560, 4608, 0.15) == [flight]
+    assert not any(r["flight_active"] for r in escorted)
+    alone = records(-900.0)         # the nearest runner far behind: a real throw
+    assert annotate_flights(alone, [flight], 2560, 4608, 0.15) == []
+    assert any(r["flight_active"] for r in alone)
+    # A throw moving mostly toward the camera, past a standing stack: barely any sideways speed,
+    # so standing players "match" it, but that says nothing and the throw is kept.
+    toward = {**flight, "x1": 900.0, "points": [[10.0 + i / 20, 800.0 + 2.5 * i, 1000.0 + 8.0 * i] for i in range(41)]}
+    stack = [{"time": i / rate, "players": [{"track_id": k, "center_x": 790.0 + 40 * k, "center_y": 1000.0 + 80 * k,
+                                             "height": 200.0, "velocity_x": 0.0} for k in range(5)]}
+             for i in range(int(20 * rate))]
+    assert annotate_flights(stack, [toward], 2560, 4608, 0.15) == []
+    assert any(r["flight_active"] for r in stack)
 
 
 def test_flight_widening_holds_both_ends_when_possible():

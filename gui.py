@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import fcntl
-import json
 from functools import wraps
 import shutil
 import subprocess
@@ -48,34 +47,10 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
                 return jsonify(error=str(error)), 400
         return wrapped
 
-    def analysis_summary(job, directory):
-        """What the automatic player analysis has produced for the outline step."""
-        status, metadata = job.status, job.metadata
-        if status['state'] in BUSY and status.get('mode') == 'analyze':
-            return {'state': 'running', 'progress': status.get('progress', 0), 'message': status.get('message', '')}
-        run_id = metadata.get('analysis_run_id')
-        if not run_id:
-            failed = status['state'] in {'failed', 'interrupted'} and status.get('mode') == 'analyze'
-            return {'state': 'failed' if failed else 'none', 'message': status.get('message', '') if failed else ''}
-        run_dir = directory / 'runs' / run_id
-        summary = {'state': 'ready', 'points': None, 'minutes': None, 'heat_url': None}
-        suggestion = run_dir / 'suggested-outline.json'
-        if suggestion.is_file():
-            try:
-                data = json.loads(suggestion.read_text())
-                summary['points'], summary['minutes'] = data.get('points'), data.get('minutes')
-            except (ValueError, TypeError):
-                pass
-        if (run_dir / 'sideline-heat.png').is_file():
-            summary['heat_url'] = f'/jobs/{job.id}/runs/{run_id}/sideline-heat.png'
-        return summary
-
     def public_job(job):
         directory = store.directory(job.id)
         metadata = job.metadata
         return {
-            'analysis': analysis_summary(job, directory),
-            'awaiting_process': bool(metadata.get('process_after_analysis')),
             'job_id': job.id, 'filename': metadata['filename'],
             'width': metadata['width'], 'height': metadata['height'],
             'duration': metadata['duration'], 'size': metadata['size'],
@@ -85,7 +60,13 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
             'frame_url': f'/jobs/{job.id}/active-area-frame.jpg',
             'preview_url': f'/jobs/{job.id}/play-area-preview.jpg',
             'status': job.status, 'points': metadata.get('points'),
+            'source_missing': not Path(metadata['video_path']).is_file(),
         }
+
+    def require_source(job_id):
+        """Analysis and processing read the source video; a job whose file was deleted cannot run."""
+        if not Path(store.get(job_id).metadata['video_path']).is_file():
+            raise ValueError("This job's source video has been deleted. Upload the video again to process it.")
 
     @app.get('/')
     def index():
@@ -94,7 +75,9 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
     @app.get('/api/jobs')
     @api_errors
     def list_jobs():
-        return jsonify([public_job(job) for job in store.list()])
+        # A job whose source video was deleted can only still show a finished output.
+        jobs = [public_job(job) for job in store.list()]
+        return jsonify([job for job in jobs if not job['source_missing'] or job['status'].get('output_url')])
 
     @app.get('/api/jobs/<job_id>')
     @api_errors
@@ -128,26 +111,14 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
         except Exception as error:
             shutil.rmtree(directory, ignore_errors=True)
             return jsonify(error=f'Could not prepare that video: {error}'), 400
-        # Player analysis starts immediately so the outline step can suggest an
-        # outline. If the queue is full the user can still draw and process.
-        try:
-            runner.submit(job_id, {'mode': 'analyze'})
-        except JobConflict:
-            pass
         return jsonify(public_job(store.get(job_id)))
-
-    @app.post('/api/analyze/<job_id>')
-    @api_errors
-    def analyze_video(job_id):
-        store.directory(job_id)
-        return jsonify(runner.submit(job_id, {'mode': 'analyze'}))
 
     @app.post('/api/active-area/<job_id>')
     @api_errors
     def create_active_area(job_id):
         with store.lock:
             job = store.get(job_id)
-            if job.status['state'] in BUSY and not store.analysis_busy(job_id):
+            if job.status['state'] in BUSY:
                 raise JobConflict('Wait for processing to finish before changing the active area.')
             directory = store.directory(job_id)
             payload = request.get_json(force=True)
@@ -173,9 +144,8 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
             cv2.fillPoly(mask, [polygon], 255)
             cv2.imwrite(str(directory / 'active-area-mask.png'), mask)
             save_mask_preview(mask, clean, directory / 'play-area-preview.jpg')
-            # A running player analysis keeps its lifecycle; only the outline changes.
-            status = job.status if store.analysis_busy(job_id) else {'state': 'ready', 'progress': 0, 'message': 'Review the active area, then process.'}
-            store.save(job_id, metadata={**job.metadata, 'points': points}, status=status)
+            store.save(job_id, metadata={**job.metadata, 'points': points},
+                       status={'state': 'ready', 'progress': 0, 'message': 'Review the active area, then process.'})
             return jsonify(preview_url=f'/jobs/{job_id}/play-area-preview.jpg?v={uuid.uuid4().hex[:8]}',
                            annotated_url=f'/jobs/{job_id}/active-area.jpg')
 
@@ -183,6 +153,7 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
     @api_errors
     def process_video(job_id):
         directory = store.directory(job_id)
+        require_source(job_id)
         if not (directory / 'active-area-mask.png').is_file():
             raise ValueError('Generate and approve an active-area preview first.')
         payload = request.get_json(silent=True) or {}
@@ -191,7 +162,7 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
         debug, auto_widen = payload.get('debug', False), payload.get('auto_widen', True)
         if type(debug) is not bool or type(auto_widen) is not bool:
             raise ValueError('Processing options must be booleans.')
-        return jsonify(runner.submit(job_id, {'mode': 'process', 'generate_debug': debug, 'auto_widen': auto_widen}))
+        return jsonify(runner.submit(job_id, {'generate_debug': debug, 'auto_widen': auto_widen}))
 
     @app.get('/api/status/<job_id>')
     @api_errors
@@ -207,8 +178,13 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
     @app.get('/jobs/<job_id>/<path:filename>')
     @api_errors
     def job_file(job_id, filename):
-        return send_from_directory(store.directory(job_id), filename,
-                                   as_attachment=request.args.get('download') == '1', conditional=True)
+        download = request.args.get('download') == '1'
+        # Saved under the operator's chosen name; the file on disk keeps its run name.
+        name = secure_filename(request.args.get('name', '')) if download else ''
+        if name and not name.lower().endswith(Path(filename).suffix.lower()):
+            name += Path(filename).suffix
+        return send_from_directory(store.directory(job_id), filename, as_attachment=download,
+                                   download_name=name or None, conditional=True)
 
     return app
 

@@ -306,6 +306,7 @@ def identify_deep_pairs(records: list[Sample], sample_rate: float, calibration: 
     pending_direction = 0
     pending_count = 0
     active_track_ids: list[int] = []
+    breakaway: list[int] = []
     active_direction = 0
     hold_samples = 0
     last_members: dict[int, dict] = {}
@@ -361,7 +362,17 @@ def identify_deep_pairs(records: list[Sample], sample_rate: float, calibration: 
                 pending_direction = direction
                 pending_count = 1
             if pending_count >= confirmation_samples:
-                active_track_ids = list(pair)
+                # A cutter who beats their defender outruns the pair limit and
+                # a new pair forms behind them, around that defender. Keep the
+                # cutter while they are still sprinting the same way, ahead of
+                # it; an unrelated pair elsewhere does not inherit them.
+                runners = {int(player["track_id"]): float(player["center_x"]) for _, _, player in groups[direction]}
+                front = max(direction * runners[track_id] for track_id in pair)
+                same_play = direction == active_direction and bool(set(pair) & set(active_track_ids))
+                breakaway = [track_id for track_id in active_track_ids
+                             if same_play and track_id not in pair
+                             and track_id in runners and direction * runners[track_id] > front]
+                active_track_ids = list(pair) + breakaway
                 active_direction = direction
                 hold_samples = round(2.5 * sample_rate)
                 candidate_confirmed = True
@@ -394,8 +405,10 @@ def identify_deep_pairs(records: list[Sample], sample_rate: float, calibration: 
             record["deep_leading_x"] = round(float(member_positions[leading_index]), 2)
             record["deep_velocity_x"] = round(float(member_velocities[leading_index]), 2)
             record["deep_active"] = True
+            record["deep_breakaway"] = bool(breakaway)
         else:
             active_track_ids = []
+            breakaway = []
             active_direction = 0
             record["deep_track_ids"] = []
             record["deep_direction"] = 0

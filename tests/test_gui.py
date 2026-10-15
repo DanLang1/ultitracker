@@ -277,7 +277,7 @@ def test_relative_workspace_paths_are_resolved_before_worker_changes_directory(t
     assert runner.calibration == tmp_path / 'camera.json'
 
 
-def test_upload_starts_player_analysis_and_mask_edits_stay_allowed(tmp_path):
+def test_upload_starts_no_work_until_process(tmp_path):
     class RecordingRunner(IdleRunner):
         submissions = []
         def submit(self, job_id, settings):
@@ -295,42 +295,40 @@ def test_upload_starts_player_analysis_and_mask_edits_stay_allowed(tmp_path):
     with source.open('rb') as handle:
         response = client.post('/api/upload', data={'video': (handle, 'game.mp4')}, content_type='multipart/form-data')
     assert response.status_code == 200, response.json
-    job_id = response.json['job_id']
-    assert RecordingRunner.submissions == [{'mode': 'analyze'}]
-    assert response.json['status']['state'] == 'queued' and response.json['status']['mode'] == 'analyze'
-    assert response.json['analysis']['state'] == 'running'
-    # Drawing the outline must not be blocked by the analysis run.
-    points = [{'x': .1, 'y': .1}, {'x': .9, 'y': .1}, {'x': .9, 'y': .9}, {'x': .1, 'y': .9}]
-    assert client.post(f'/api/active-area/{job_id}', json={'points': points}).status_code == 200
-    # Deleting still waits for the run to finish.
-    assert client.delete(f'/api/jobs/{job_id}').status_code == 409
+    assert RecordingRunner.submissions == []
+    assert response.json['status']['state'] == 'ready'
 
 
-def test_worker_analysis_run_records_suggestion_and_starts_queued_processing(application):
+def test_jobs_left_by_the_old_upload_analysis_recover_as_ready(application):
     store = application.extensions['job_store']
-    job_id, run_id = 'a' * 32, 'b' * 32
-    store.claim(job_id, {'mode': 'analyze'}, run_id)
-    assert store.analysis_busy(job_id)
-    runner = JobRunner(store, Path(__file__).resolve().parents[1])
-    # Processing requested mid-analysis is remembered rather than dropped.
-    assert runner.submit(job_id, {'mode': 'process', 'auto_widen': True})['state'] == 'queued'
-    assert store.get(job_id).metadata['process_after_analysis'] == {'mode': 'process', 'auto_widen': True}
-    class Process:
-        def __init__(self, command, **kwargs):
-            assert '--detect-only' in command and '--play-area' not in command
-            output = Path(command[command.index('--output-dir') + 1])
-            (output / 'detections.json').write_bytes(b'{}')
-            (output / 'suggested-outline.json').write_text(json.dumps({'points': [{'x': .1, 'y': .2}, {'x': .9, 'y': .2}, {'x': .5, 'y': .9}], 'minutes': 12}))
-            (output / 'sideline-heat.png').write_bytes(b'png')
-            self.stdout = io.StringIO(json.dumps(ProgressEvent('detection', 1, 2).__dict__) + '\n' + json.dumps(ProgressEvent('complete', 1, 1).__dict__) + '\n')
-        def wait(self): return 0
-        def poll(self): return 0
-    followed = []
-    with patch('panstudio.worker.subprocess.Popen', Process), patch.object(runner, 'submit', lambda job, settings: followed.append(settings)):
-        runner.run(job_id, run_id)
-    job = store.get(job_id)
-    assert job.status['state'] == 'analyzed'
-    assert job.metadata['analysis_run_id'] == run_id and 'process_after_analysis' not in job.metadata
-    assert followed == [{'mode': 'process', 'auto_widen': True}]
-    summary = application.test_client().get(f'/api/jobs/{job_id}').json['analysis']
-    assert summary['state'] == 'ready' and len(summary['points']) == 3 and summary['heat_url'].endswith('sideline-heat.png')
+    job_id = 'a' * 32
+    store.save(job_id, status={'state': 'analyzed', 'progress': 100, 'mode': 'analyze', 'message': 'Player analysis complete.'})
+    store.recover()
+    assert store.get(job_id).status['state'] == 'ready'
+
+
+def test_saved_video_downloads_under_the_chosen_name(application):
+    client = application.test_client()
+    job_id = 'a' * 32
+    run = application.extensions['job_store'].root / job_id / 'runs' / ('b' * 32)
+    run.mkdir(parents=True)
+    (run / 'tactical-crop.mp4').write_bytes(b'video')
+    url = f'/jobs/{job_id}/runs/{"b" * 32}/tactical-crop.mp4'
+    named = client.get(f'{url}?download=1&name=vs%20Dynasty%20final')
+    assert 'filename=vs_Dynasty_final.mp4' in named.headers['Content-Disposition']
+    traversal = client.get(f'{url}?download=1&name=../../etc/passwd')
+    assert '/' not in traversal.headers['Content-Disposition'].split('filename=')[1]
+    plain = client.get(f'{url}?download=1')
+    assert 'filename=tactical-crop.mp4' in plain.headers['Content-Disposition']
+    assert client.get(f'{url}?name=ignored').headers['Content-Disposition'].startswith('inline')
+
+
+def test_jobs_whose_source_was_deleted_are_hidden_and_cannot_run(application):
+    client = application.test_client()
+    job_id = 'a' * 32
+    (application.extensions['job_store'].root / job_id / 'source.mp4').unlink()
+    assert client.get('/api/jobs').json == []          # nothing left to open, so not listed
+    assert client.get(f'/api/jobs/{job_id}').json['source_missing'] is True
+    response = client.post(f'/api/process/{job_id}', json={})
+    assert response.status_code == 400 and 'deleted' in response.json['error']
+    assert application.extensions['job_runner'].calls == 0

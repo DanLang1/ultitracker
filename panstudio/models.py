@@ -105,6 +105,7 @@ class ProcessingConfig:
     start: float
     end: float
     output_dir: Path = Path('prototype/output')
+    output_name: str = 'tactical-crop'
     model: str = 'yolo11s.pt'
     sample_rate: float = 5.0
     inference_size: int = 1920
@@ -138,6 +139,10 @@ class ProcessingConfig:
             raise ValueError('Processing settings must be finite')
         if self.start < 0 or self.end <= self.start:
             raise ValueError('Require 0 <= start < end')
+        name = self.output_name.removesuffix('.mp4')
+        if not name or name in ('.', '..') or '/' in name or '\\' in name or name == 'debug-wide':
+            raise ValueError('Output name must be a plain file name')
+        object.__setattr__(self, 'output_name', name)
         if min(self.sample_rate, self.correction_radius, self.disc_radius) <= 0:
             raise ValueError('Sample rate and anchor radii must be positive')
         if not 0 <= self.confidence <= 1 or not 0 <= self.disc_weight <= 1:

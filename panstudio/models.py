@@ -10,6 +10,7 @@ from .calibration import Calibration
 
 
 DEVICES = ('auto', 'cpu', 'mps')
+DEFAULT_MODEL = 'yolo11s.pt'
 
 
 class SourceIdentity(TypedDict):
@@ -75,6 +76,7 @@ class Sample(TypedDict):
     deep_leading_x: NotRequired[float]
     deep_velocity_x: NotRequired[float]
     deep_active: NotRequired[bool]
+    deep_breakaway: NotRequired[bool]
     deep_preroll: NotRequired[bool]
     deep_baseline_infeasible: NotRequired[bool]
     deep_protected_baseline_min: NotRequired[float]
@@ -92,6 +94,8 @@ class Sample(TypedDict):
     flight_y0: NotRequired[float]
     flight_x1: NotRequired[float]
     flight_y1: NotRequired[float]
+    flight_start: NotRequired[float]
+    flight_launch_seen: NotRequired[bool]
     crop_width: NotRequired[float]
     crop_height: NotRequired[float]
     center_x: NotRequired[float]
@@ -106,7 +110,7 @@ class ProcessingConfig:
     end: float
     output_dir: Path = Path('prototype/output')
     output_name: str = 'tactical-crop'
-    model: str = 'yolo11s.pt'
+    model: str = DEFAULT_MODEL
     sample_rate: float = 5.0
     inference_size: int = 1920
     confidence: float = 0.18
@@ -117,9 +121,6 @@ class ProcessingConfig:
     play_area: Path | None = None
     corrections: Path | None = None
     correction_radius: float = 4.0
-    disc_points: Path | None = None
-    disc_weight: float = 0.22
-    disc_radius: float = 2.0
     look_room: float = 0.15
     deep_lookahead: float = 0.6
     no_deep_tracking: bool = False
@@ -128,13 +129,12 @@ class ProcessingConfig:
     no_auto_widen: bool = False
     debug: bool = False
     device: str = 'auto'
-    frame_width: int | None = None
     calibration: Calibration = field(default_factory=Calibration)
 
     def __post_init__(self):
         if self.device not in DEVICES:
             raise ValueError(f"Device must be one of {', '.join(DEVICES)}")
-        numeric = ('start', 'end', 'sample_rate', 'confidence', 'correction_radius', 'disc_radius', 'disc_weight', 'look_room', 'deep_lookahead')
+        numeric = ('start', 'end', 'sample_rate', 'confidence', 'correction_radius', 'look_room', 'deep_lookahead')
         if any(not math.isfinite(getattr(self, name)) for name in numeric):
             raise ValueError('Processing settings must be finite')
         if self.start < 0 or self.end <= self.start:
@@ -143,10 +143,10 @@ class ProcessingConfig:
         if not name or name in ('.', '..') or '/' in name or '\\' in name or name == 'debug-wide':
             raise ValueError('Output name must be a plain file name')
         object.__setattr__(self, 'output_name', name)
-        if min(self.sample_rate, self.correction_radius, self.disc_radius) <= 0:
-            raise ValueError('Sample rate and anchor radii must be positive')
-        if not 0 <= self.confidence <= 1 or not 0 <= self.disc_weight <= 1:
-            raise ValueError('Confidence and disc weight must be between 0 and 1')
+        if min(self.sample_rate, self.correction_radius) <= 0:
+            raise ValueError('Sample rate and correction radius must be positive')
+        if not 0 <= self.confidence <= 1:
+            raise ValueError('Confidence must be between 0 and 1')
         if self.look_room < 0 or self.deep_lookahead < 0:
             raise ValueError('Look room and lookahead cannot be negative')
         if min(self.inference_size, self.crop_width, self.crop_height, self.output_width, self.output_height) <= 0:

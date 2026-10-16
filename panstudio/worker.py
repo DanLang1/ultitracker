@@ -10,7 +10,7 @@ import uuid
 
 from .artifacts import flights_version, load_detections
 from .disc import DETECTOR_VERSION
-from .models import ProcessingConfig
+from .models import DEFAULT_MODEL, ProcessingConfig
 from .pipeline import probe_video, validate_reuse
 from .events import ProgressEvent
 from .jobs import BUSY, JobConflict, JobStore
@@ -75,15 +75,18 @@ class JobRunner:
             output = directory / 'runs' / run_id
             output.mkdir(parents=True, exist_ok=True)
             metadata = job.metadata
+            # The whole video, stopping just short of the reported duration, which
+            # containers often overstate by a frame.
+            end = max(0.1, metadata['duration'] - 0.05)
+            model = str(self.root / DEFAULT_MODEL)
             command = [sys.executable, str(self.root / 'tactical_pan.py'), metadata['video_path'],
-                       '--start', '0', '--end', str(max(0.1, metadata['duration'] - 0.05)),
-                       '--output-dir', str(output), '--model', str(self.root / 'yolo11s.pt'), '--supervised',
+                       '--start', '0', '--end', str(end), '--output-dir', str(output), '--model', model, '--supervised',
                        '--play-area', str(directory / 'active-area-mask.png')]
             # A failed retry may not have produced detections. Look back through all
             # attempts and reuse the newest valid cache, rather than losing earlier work.
             caches = sorted((directory / 'runs').glob('*/detections.json'), key=lambda path: path.stat().st_mtime_ns, reverse=True)
             if caches:
-                config = ProcessingConfig(Path(metadata['video_path']), 0, max(0.1, metadata['duration'] - 0.05), model=str(self.root / 'yolo11s.pt'))
+                config = ProcessingConfig(Path(metadata['video_path']), 0, end, model=model)
                 video = probe_video(config.input)
                 for cached in caches:
                     try:

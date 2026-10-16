@@ -47,9 +47,8 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return float(values[np.searchsorted(np.cumsum(weights), total_weight / 2, side="left")])
 
 
-def field_bounds(foot_y: float, width: int, calibration: Calibration | None = None) -> tuple[float, float]:
-    """Approximate the two blue sidelines visible in this camera view."""
-    calibration = calibration or Calibration()
+def field_bounds(foot_y: float, width: int, calibration: Calibration) -> tuple[float, float]:
+    """Approximate the two sidelines from the calibrated camera perspective."""
     depth = max(0.0, foot_y - calibration.sideline_origin_y)
     return calibration.sideline_left_slope * depth, width - calibration.sideline_right_slope * depth
 
@@ -59,9 +58,8 @@ def select_field_players(
     confidences: np.ndarray,
     width: int,
     play_area_mask: np.ndarray | None,
-    calibration: Calibration | None = None,
+    calibration: Calibration,
 ) -> list[Player]:
-    calibration = calibration or Calibration()
     selected = []
     for box, confidence in zip(boxes, confidences):
         x1, y1, x2, y2 = map(float, box)
@@ -106,9 +104,8 @@ def select_field_players(
     return selected
 
 
-def suppress_stationary_tracks(records: list[Sample], sample_rate: float, calibration: Calibration | None = None):
+def suppress_stationary_tracks(records: list[Sample], sample_rate: float, calibration: Calibration):
     """Down-weight people who remain in one patch for most of the point."""
-    calibration = calibration or Calibration()
     tracks: dict[int, list[tuple[int, Player]]] = {}
     track_state: dict[int, dict] = {}
     next_track_id = 0
@@ -297,9 +294,8 @@ def calculate_raw_centers(records: list[Sample], width: int):
         record["raw_center_x"] = round(last_center, 2)
 
 
-def identify_deep_pairs(records: list[Sample], sample_rate: float, calibration: Calibration | None = None):
+def identify_deep_pairs(records: list[Sample], sample_rate: float, calibration: Calibration):
     """Find persistent, fast breakaway tracks without chasing every deep cut."""
-    calibration = calibration or Calibration()
     # Confirm a pair after about 0.6 s of agreement, never fewer than two samples.
     confirmation_samples = max(2, round(0.6 * sample_rate))
     pending_pair: tuple[int, int] | None = None

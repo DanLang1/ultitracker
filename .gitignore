@@ -36,3 +36,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local Claude Code configuration
+.claude/

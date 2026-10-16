@@ -9,7 +9,7 @@ from .artifacts import source_identity
 from .events import report
 from .media import render, sampled_analysis_frames
 from .models import CameraPlan, Detection, DetectionSample, DetectionSet, DetectorSettings, ProcessingConfig, Sample, VideoInfo
-from .planning import annotate_flights, apply_crop_geometry, apply_deep_coverage, apply_disc_anchors, apply_flight_targets, apply_manual_corrections, smooth_centers
+from .planning import annotate_flights, apply_crop_geometry, apply_deep_coverage, apply_flight_targets, apply_manual_corrections, smooth_centers
 from .tracking import calculate_raw_centers, identify_deep_pairs, select_field_players, suppress_bystanders, suppress_stationary_tracks
 
 
@@ -27,10 +27,10 @@ def probe_video(path: Path) -> VideoInfo:
         cap.release()
 
 
-def validate_video(config: ProcessingConfig, video: VideoInfo):
+def validate_video(config: ProcessingConfig, video: VideoInfo, *, check_crop: bool = True):
     if config.end > video.duration + 1 / video.fps:
         raise ValueError('Requested end exceeds the source duration')
-    if config.crop_width > video.width or config.crop_height > video.height:
+    if check_crop and (config.crop_width > video.width or config.crop_height > video.height):
         raise ValueError('Crop is larger than the source video')
 
 
@@ -96,7 +96,7 @@ def plan_camera(config: ProcessingConfig, detections: DetectionSet, mask=None, f
     """Build fresh working records on every call so repeated planning is deterministic."""
     video = detections.video
     calibration = config.calibration.scaled(video.width, video.height)
-    args = replace(config, frame_width=video.width, calibration=calibration)
+    args = replace(config, calibration=calibration)
     records: list[Sample] = []
     for sample in detections.samples:
         players = select_field_players(
@@ -112,15 +112,14 @@ def plan_camera(config: ProcessingConfig, detections: DetectionSet, mask=None, f
     identify_deep_pairs(records, args.sample_rate, calibration)
     raw = np.array([record['raw_center_x'] for record in records])
     centers = smooth_centers(raw, args.crop_width, video.width, args.sample_rate, calibration)
-    centers = apply_deep_coverage(args, records, centers)
+    centers = apply_deep_coverage(args, records, centers, video.width)
     if flights and not config.no_disc_tracking:
         ignored = annotate_flights(records, flights, args.crop_width, video.width, args.look_room)
         if ignored:
             report('planning', 0, 1, f'Ignored {len(ignored)} long flights that moved with a runner: '
                    + ', '.join(f"{int(f['start'] // 60)}:{f['start'] % 60:04.1f}" for f in ignored))
-        centers = apply_flight_targets(args, records, centers)
+        centers = apply_flight_targets(args, records, centers, video.width)
     times = np.array([record['time'] for record in records])
-    centers = apply_disc_anchors(args, times, centers)
     centers = apply_manual_corrections(args, times, centers)
     centers = np.clip(centers, args.crop_width / 2, video.width - args.crop_width / 2)
     apply_crop_geometry(args, records, centers, video.width, video.height)

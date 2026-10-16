@@ -3,6 +3,8 @@ name = "tactical-pan-studio"
 version = "0.1.0"
 description = "Local tactical auto-pan processing for fixed wide-angle ultimate footage"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "flask>=3.1,<4",
@@ -14,9 +16,17 @@ dependencies = [
 [dependency-groups]
 dev = [
   "pytest>=8.3,<9",
+  "ruff>=0.6",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+ignore = ["B905"]

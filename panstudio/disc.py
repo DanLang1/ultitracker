@@ -77,21 +77,12 @@ class Flight:
         return data
 
 
-_SAMPLE_TIMES: dict[int, np.ndarray] = {}
-
-
 def _sample_times(detections: DetectionSet) -> np.ndarray:
-    """Sample times as an array, cached per detection set: this runs once per frame."""
-    key = id(detections)
-    if key not in _SAMPLE_TIMES:
-        _SAMPLE_TIMES.clear()
-        _SAMPLE_TIMES[key] = np.array([s.time for s in detections.samples])
-    return _SAMPLE_TIMES[key]
+    return np.array([s.time for s in detections.samples])
 
 
-def _boxes_at(detections: DetectionSet, relative_time: float):
+def _boxes_at(detections: DetectionSet, times: np.ndarray, relative_time: float):
     """Person boxes near a moment, taken from the two nearest analysis samples."""
-    times = _sample_times(detections)
     index = int(np.searchsorted(times, relative_time))
     chosen = []
     for i in (index - 1, index):
@@ -100,10 +91,10 @@ def _boxes_at(detections: DetectionSet, relative_time: float):
     return chosen
 
 
-def person_mask(detections: DetectionSet, relative_time: float, height: int, width: int, scale: int = 1) -> np.ndarray:
+def person_mask(detections: DetectionSet, times: np.ndarray, relative_time: float, height: int, width: int, scale: int) -> np.ndarray:
     """Dilated person boxes on a (height, width) mask whose pixels are `scale` source pixels."""
     mask = np.zeros((height, width), dtype=np.uint8)
-    for x1, y1, x2, y2 in _boxes_at(detections, relative_time):
+    for x1, y1, x2, y2 in _boxes_at(detections, times, relative_time):
         w, h = x2 - x1, y2 - y1
         cv2.rectangle(mask, (int((x1 - 0.6 * w) / scale), int((y1 - 0.4 * h) / scale)),
                       (int((x2 + 0.6 * w) / scale), int((y2 + 0.3 * h) / scale)), 255, -1)
@@ -186,8 +177,7 @@ class ClutterMap:
 class Linker:
     """Greedy nearest-prediction linking with a short memory for occlusions."""
 
-    def __init__(self, fps: float):
-        self.fps = fps
+    def __init__(self):
         self.active: list[dict] = []
         self.done: list[dict] = []
         self.previous: list[tuple[float, float, int, int]] = []
@@ -259,10 +249,10 @@ def _body_height_model(detections: DetectionSet):
     return lambda y: max(30.0, slope * y + intercept)
 
 
-def _near_person(detections: DetectionSet, t: float, x: float, y: float, body: float):
+def _near_person(detections: DetectionSet, times: np.ndarray, t: float, x: float, y: float, body: float):
     """Height of the nearest person box within reach of (x, y), or None."""
     best = None
-    for x1, y1, x2, y2 in _boxes_at(detections, t):
+    for x1, y1, x2, y2 in _boxes_at(detections, times, t):
         cx, cy = (x1 + x2) / 2, y2
         distance = math.hypot(x - cx, y - cy)
         if distance <= NEAR_PERSON * max(body, y2 - y1) and (best is None or distance < best[0]):
@@ -282,9 +272,10 @@ def _bow(points: np.ndarray) -> float:
     return float(np.max(start[1] + along * chord[1] - points[:, 1]))
 
 
-def _qualify(tracks, detections: DetectionSet, fps: float, offset: float, play_area: np.ndarray | None = None,
+def _qualify(tracks, detections: DetectionSet, fps: float, play_area: np.ndarray | None = None,
              tops: np.ndarray | None = None) -> list[Flight]:
     body_at = _body_height_model(detections)
+    times = _sample_times(detections)
     if play_area is not None and play_area.any():
         rows = np.where(play_area.max(axis=1) > 0)[0]
         far_edge, near_edge = float(rows.min()), float(rows.max())
@@ -336,12 +327,12 @@ def _qualify(tracks, detections: DetectionSet, fps: float, offset: float, play_a
             continue
         if lowest < edge and normalized < SKY_MIN_SPEED:
             continue
-        t0, t1 = offset + frames[0] / fps, offset + frames[-1] / fps
+        t0, t1 = frames[0] / fps, frames[-1] / fps
         # Every flight leaves a hand or arrives in one; clouds, birds and
         # traffic do neither. The people involved also give the flight's
         # length a scale, which the disc's own height above the field cannot.
-        thrower = _near_person(detections, t0, *points[0], body)
-        receiver = _near_person(detections, t1, *points[-1], body)
+        thrower = _near_person(detections, times, t0, *points[0], body)
+        receiver = _near_person(detections, times, t1, *points[-1], body)
         if thrower is None and receiver is None:
             continue
         people = [h for h in (thrower, receiver) if h is not None]
@@ -349,7 +340,7 @@ def _qualify(tracks, detections: DetectionSet, fps: float, offset: float, play_a
         flights.append(Flight(round(t0, 3), round(t1, 3), *map(float, points[0]), *map(float, points[-1]),
                              1 if points[-1][0] >= points[0][0] else -1, len(points), chord, speed,
                              round(chord / length_scale, 2), thrower is not None,
-                             [(offset + f / fps, x, y) for f, x, y, _ in track['points']]))
+                             [(f / fps, x, y) for f, x, y, _ in track['points']]))
     return _merge(flights)
 
 
@@ -373,21 +364,20 @@ def _merge(flights: list[Flight]) -> list[Flight]:
 
 
 def detect_flights(config: ProcessingConfig, video, detections: DetectionSet, play_area: np.ndarray | None,
-                   start: float | None = None, end: float | None = None, progress=None, scale: int = SCAN_SCALE) -> list[Flight]:
-    """Scan [start, end] (seconds, relative to config.start) at full frame rate, decoding at 1/scale."""
+                   progress=None, scale: int = SCAN_SCALE) -> list[Flight]:
+    """Scan the configured range at full frame rate, decoding at 1/scale."""
     width, height, fps = video.width, video.height, video.fps
-    start = 0.0 if start is None else start
-    end = (config.end - config.start) if end is None else end
-    total = int(round((end - start) * fps))
+    total = int(round((config.end - config.start) * fps))
     allowed, tops = allowed_region(play_area, height, width)
     low_width, low_height = width // scale, height // scale
     allowed_low = cv2.resize(allowed, (low_width, low_height), interpolation=cv2.INTER_NEAREST)
-    command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', str(config.start + start), '-i', str(config.input),
+    command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', str(config.start), '-i', str(config.input),
                '-frames:v', str(total), '-an', '-sn', '-dn', '-vf', f'scale={low_width}:{low_height}',
                '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1']
     process = subprocess.Popen(command, stdout=subprocess.PIPE)
-    linker = Linker(fps)
+    linker = Linker()
     clutter = ClutterMap(height, width)
+    times = _sample_times(detections)
     frame_bytes = low_width * low_height
     frame_index = 0
     try:
@@ -402,9 +392,9 @@ def detect_flights(config: ProcessingConfig, video, detections: DetectionSet, pl
                 break
             median = np.median(np.stack(chunk[::3]), axis=0).astype(np.int16)
             for gray in chunk:
-                t = start + frame_index / fps
+                t = frame_index / fps
                 blocked = allowed_low.copy()
-                blocked[person_mask(detections, t, low_height, low_width, scale) > 0] = 0
+                blocked[person_mask(detections, times, t, low_height, low_width, scale) > 0] = 0
                 found = _candidates(gray, median, blocked, scale)
                 clutter.update(found)
                 linker.step(frame_index, *clutter.split(found))
@@ -414,4 +404,4 @@ def detect_flights(config: ProcessingConfig, video, detections: DetectionSet, pl
     finally:
         process.stdout.close()
         process.wait()
-    return _qualify(linker.finish(), detections, fps, start, play_area, tops)
+    return _qualify(linker.finish(), detections, fps, play_area, tops)

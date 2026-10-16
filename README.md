@@ -53,7 +53,7 @@ does not affect detection reuse.
 ## Run one point
 
 ```bash
-uv run python tactical_pan.py vssdynasty.mp4 \
+uv run python tactical_pan.py game.mp4 \
   --start 21.8 \
   --end 74.2 \
   --play-area active-area.jpg \
@@ -63,7 +63,7 @@ uv run python tactical_pan.py vssdynasty.mp4 \
 
 When `--debug` is supplied, `debug-wide.mp4` shows retained detections and the
 smoothed crop. Without it, only the faster `tactical-crop.mp4` render is created;
-`--output-name vs-dynasty` names it `vs-dynasty.mp4` instead. In the GUI, the
+`--output-name final-cut` names it `final-cut.mp4` instead. In the GUI, the
 **Save as** field next to **Save tactical video** sets the downloaded file's name
 (it defaults to the source video's name plus `-tactical`).
 The crop decisions are also saved as `pan-path.csv` and `analysis.json`.
@@ -85,7 +85,7 @@ checked before relying on it.
 To inspect a mask without rerunning detection or video rendering:
 
 ```bash
-uv run python tactical_pan.py vssdynasty.mp4 \
+uv run python tactical_pan.py game.mp4 \
   --start 21.8 --end 74.2 \
   --play-area active-area.jpg \
   --preview-mask-only \
@@ -94,15 +94,6 @@ uv run python tactical_pan.py vssdynasty.mp4 \
 
 The red outline is the exact tracking boundary. Redraw the outline when an edge
 needs adjustment.
-
-The CLI equivalent of the analysis step is `--detect-only`, which also writes
-`suggested-outline.json` (normalized polygon points) and `sideline-heat.png`
-next to `detections.json`. Recordings shorter than five minutes get a heat map
-but no outline suggestion. The suggestion is behaviour-based: cells of the frame
-where running happens in a large share of the recording's minutes form the
-field, cells occupied for most of the recording are carved out, and grid cells
-scale with the local body size so near and far depths are comparable. Its weak
-spot is the near sideline where substitutes jog, so check that edge.
 
 The outline is a coarse boundary, not a precision instrument. Inside it, the
 planner separates players from bystanders on its own: each detection is
@@ -118,9 +109,9 @@ still helps.
 
 ## Lightweight manual guidance
 
-For occasional framing fixes, copy `manual-corrections-template.csv`, add a few
-rows containing `source_time_seconds,center_x`, and pass it with `--corrections`.
-Each correction blends smoothly into the automatic path over four seconds.
+For occasional framing fixes, write a CSV with a `source_time_seconds,center_x`
+header and one row per fix, and pass it with `--corrections`. Each correction
+blends smoothly into the automatic path over four seconds (`--correction-radius`).
 
 ## Disc flights
 
@@ -149,15 +140,11 @@ visible when it can. The debug video draws the flight and its landing point in
 magenta. Use `--no-disc-tracking` to compare against formation-only framing.
 
 Flights are written to `flights.json` (schema `flights/v1`) next to
-`detections.json`. The analysis step that follows an upload computes them
-using the suggested outline as its playing area; a processing run without a
-saved file scans the video again, and `--flights-in` reuses one. Scanning runs
-at roughly twice real time on this machine.
-
-Manual disc anchors remain available: copy `disc-points-template.csv`, add
-`source_time_seconds,disc_x,direction` rows, and pass it with `--disc-points`.
-Direction is `1` for right and `-1` for left. The camera gives 15% of the crop
-width as look room in that direction.
+`detections.json`, using the field mask as the playing area. `--flights-in`
+reuses a saved file; GUI retries reuse flights from earlier attempts made by
+the same detector version. Scanning runs at roughly twice real time on an
+Apple-silicon laptop. `--look-room` sets how much of the crop width is shown
+ahead of a landing (15% by default).
 
 Fast deep pairs are tracked automatically. The tracker tolerates brief missed
 detections, begins the pan about half a second before a pair is fully confirmed,
@@ -270,17 +257,15 @@ sizes remain explicit CLI options, with 2560×1440 defaults.
   restart recovery, and a bounded local subprocess queue.
 - `gui.py` and `panstudio/cli.py`: HTTP and command-line adapters. The web app uses
   an application factory; tests can supply an isolated job store and runner.
-- `tactical_pan.py`: existing CLI entry point and compatibility exports for the
-  original algorithm functions.
+- `tactical_pan.py`: CLI entry point.
 
 The local GUI server owns its jobs folder exclusively; a second server using the
 same folder is rejected. Use a different `--jobs-root` to run a separate workspace.
-Queued/running jobs cannot be deleted or have their field mask changed. Existing
-prototype `job.json` files are imported on startup without treating old output
-files as proof of successful completion.
+Queued/running jobs cannot be deleted or have their field mask changed.
 
 ```bash
 uv run pytest
+uv run ruff check .
 ```
 
 Tests include artifact reuse, calibration scaling, framing regressions, queue

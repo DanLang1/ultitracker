@@ -45,6 +45,19 @@ def load_play_area_mask(path: Path, width: int, height: int) -> np.ndarray:
     return mask
 
 
+def polygon_mask(points: list[dict], width: int, height: int) -> np.ndarray:
+    """Rasterize normalized {x, y} outline points into a binary mask."""
+    coordinates = np.array([[point['x'], point['y']] for point in points], dtype=float)
+    if not np.isfinite(coordinates).all():
+        raise ValueError('Outline coordinates must be finite.')
+    polygon = (np.clip(coordinates, 0, 1) * [width - 1, height - 1]).astype(np.int32)
+    if abs(cv2.contourArea(polygon)) < 1:
+        raise ValueError('Draw an outline with a nonempty interior.')
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], 255)
+    return mask
+
+
 def save_mask_preview(mask: np.ndarray, clean_frame: np.ndarray, path: Path):
     preview = clean_frame.copy()
     excluded = mask == 0

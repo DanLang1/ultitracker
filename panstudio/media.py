@@ -9,6 +9,14 @@ from .models import ProcessingConfig, Sample
 from .events import report
 
 
+def extract_frame(source: Path, time: float, output: Path, width: int):
+    """Save one frame as a JPEG scaled to the given width."""
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", str(time), "-i", str(source),
+        "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "2", str(output),
+    ], check=True, capture_output=True)
+
+
 def letterbox_crop(frame: np.ndarray, crop_x: int, crop_y: int, crop_width: int, crop_height: int, out_width: int, out_height: int) -> np.ndarray:
     cropped = frame[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
     # Independently rounded crop dimensions can differ from the target aspect

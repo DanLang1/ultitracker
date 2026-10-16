@@ -89,7 +89,7 @@ class JobStore:
             job = self.get(job_id)
             if job.status['state'] in BUSY:
                 return False
-            metadata = {**job.metadata, **settings, 'previous_run_id': job.metadata.get('run_id'), 'run_id': run_id}
+            metadata = {**job.metadata, **settings, 'run_id': run_id}
             self.save(job_id, metadata=metadata, status={'state': 'queued', 'progress': 0,
                                                          'message': 'Waiting for the processor…'})
             return True
@@ -118,22 +118,7 @@ class JobStore:
     def recover(self):
         """Called once by the server owner. Never restart work without user action."""
         with self.lock:
-            # Import jobs made by the prototype without inferring success from a possibly partial video.
-            for path in self.root.glob('*/job.json'):
-                if not re.fullmatch(r'[a-f0-9]{32}', path.parent.name):
-                    continue
-                try:
-                    self.get(path.parent.name)
-                except FileNotFoundError:
-                    try:
-                        metadata = json.loads(path.read_text())
-                        self.create(path.parent.name, metadata)
-                    except (ValueError, TypeError):
-                        continue
             for job in self.list():
-                if job.status.get('mode') == 'analyze' and job.status['state'] not in BUSY:
-                    # Left by the removed upload-time player analysis: the job never processed.
-                    self.save(job.id, status={'state': 'ready', 'progress': 0, 'message': 'Review the active area, then process.'})
-                elif job.status['state'] in BUSY:
+                if job.status['state'] in BUSY:
                     self.save(job.id, status={'state': 'interrupted', 'progress': 0,
                                              'message': 'Processing was interrupted. You can retry this job.'})

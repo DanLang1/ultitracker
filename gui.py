@@ -7,19 +7,18 @@ import atexit
 import fcntl
 from functools import wraps
 import shutil
-import subprocess
 import threading
 import uuid
 import webbrowser
 from pathlib import Path
 
 import cv2
-import numpy as np
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from werkzeug.utils import secure_filename
 
 from panstudio.jobs import BUSY, JobConflict, JobStore
-from panstudio.masking import save_mask_preview
+from panstudio.masking import polygon_mask, save_mask_preview
+from panstudio.media import extract_frame
 from panstudio.pipeline import probe_video
 from panstudio.worker import JobRunner
 
@@ -99,14 +98,10 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
             uploaded.save(video_path)
             video = probe_video(video_path)
             preview_time = min(40.0, max(0.0, video.duration * 0.2))
-            subprocess.run([
-                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-ss', str(preview_time),
-                '-i', str(video_path), '-frames:v', '1', '-vf', 'scale=1600:-2', '-q:v', '2',
-                str(directory / 'active-area-frame.jpg'),
-            ], check=True, capture_output=True)
+            extract_frame(video_path, preview_time, directory / 'active-area-frame.jpg', width=1600)
             metadata = {'width': video.width, 'height': video.height, 'duration': video.duration,
                         'size': video_path.stat().st_size, 'job_id': job_id, 'filename': filename,
-                        'video_path': str(video_path.resolve()), 'preview_time': preview_time, 'auto_widen': True}
+                        'video_path': str(video_path.resolve()), 'auto_widen': True}
             store.create(job_id, metadata)
         except Exception as error:
             shutil.rmtree(directory, ignore_errors=True)
@@ -127,27 +122,16 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
             points = payload.get('points', [])
             if len(points) < 3:
                 raise ValueError('Draw one closed outline around the active field.')
-            coordinates = np.array([[point['x'], point['y']] for point in points], dtype=float)
-            if not np.isfinite(coordinates).all():
-                raise ValueError('Outline coordinates must be finite.')
             clean = cv2.imread(str(directory / 'active-area-frame.jpg'))
             if clean is None:
                 raise ValueError('The preview frame is missing')
             height, width = clean.shape[:2]
-            polygon = (np.clip(coordinates, 0, 1) * [width - 1, height - 1]).astype(np.int32)
-            if abs(cv2.contourArea(polygon)) < 1:
-                raise ValueError('Draw an outline with a nonempty interior.')
-            annotated = clean.copy()
-            cv2.polylines(annotated, [polygon], True, (0, 0, 255), max(8, width // 180), cv2.LINE_AA)
-            cv2.imwrite(str(directory / 'active-area.jpg'), annotated, [cv2.IMWRITE_JPEG_QUALITY, 96])
-            mask = np.zeros((height, width), dtype=np.uint8)
-            cv2.fillPoly(mask, [polygon], 255)
+            mask = polygon_mask(points, width, height)
             cv2.imwrite(str(directory / 'active-area-mask.png'), mask)
             save_mask_preview(mask, clean, directory / 'play-area-preview.jpg')
             store.save(job_id, metadata={**job.metadata, 'points': points},
                        status={'state': 'ready', 'progress': 0, 'message': 'Review the active area, then process.'})
-            return jsonify(preview_url=f'/jobs/{job_id}/play-area-preview.jpg?v={uuid.uuid4().hex[:8]}',
-                           annotated_url=f'/jobs/{job_id}/active-area.jpg')
+            return jsonify(preview_url=f'/jobs/{job_id}/play-area-preview.jpg?v={uuid.uuid4().hex[:8]}')
 
     @app.post('/api/process/<job_id>')
     @api_errors
@@ -206,7 +190,7 @@ def main():
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise SystemExit('Another Tactical Pan Studio server is using this jobs folder.')
+            raise SystemExit('Another Tactical Pan Studio server is using this jobs folder.') from None
         app = create_app(arguments.jobs_root, calibration=arguments.calibration)
         runner = app.extensions['job_runner']
         atexit.register(runner.close)

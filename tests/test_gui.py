@@ -199,15 +199,6 @@ def test_worker_reports_structured_error(application):
     assert store.get(job_id).status['error'] == 'Bad calibration'
 
 
-def test_legacy_jobs_are_imported(tmp_path):
-    directory = tmp_path / ('a' * 32)
-    directory.mkdir()
-    (directory / 'job.json').write_text(json.dumps({'filename': 'old.mp4'}))
-    store = JobStore(tmp_path)
-    store.recover()
-    assert store.get('a' * 32).metadata['filename'] == 'old.mp4'
-
-
 def test_invalid_boolean_does_not_start_job(application):
     client = application.test_client()
     assert client.post('/api/process/' + 'a' * 32, json={'debug': 'false'}).status_code == 400
@@ -299,14 +290,6 @@ def test_upload_starts_no_work_until_process(tmp_path):
     assert response.json['status']['state'] == 'ready'
 
 
-def test_jobs_left_by_the_old_upload_analysis_recover_as_ready(application):
-    store = application.extensions['job_store']
-    job_id = 'a' * 32
-    store.save(job_id, status={'state': 'analyzed', 'progress': 100, 'mode': 'analyze', 'message': 'Player analysis complete.'})
-    store.recover()
-    assert store.get(job_id).status['state'] == 'ready'
-
-
 def test_saved_video_downloads_under_the_chosen_name(application):
     client = application.test_client()
     job_id = 'a' * 32
@@ -314,8 +297,8 @@ def test_saved_video_downloads_under_the_chosen_name(application):
     run.mkdir(parents=True)
     (run / 'tactical-crop.mp4').write_bytes(b'video')
     url = f'/jobs/{job_id}/runs/{"b" * 32}/tactical-crop.mp4'
-    named = client.get(f'{url}?download=1&name=vs%20Dynasty%20final')
-    assert 'filename=vs_Dynasty_final.mp4' in named.headers['Content-Disposition']
+    named = client.get(f'{url}?download=1&name=Semifinal%20game%202')
+    assert 'filename=Semifinal_game_2.mp4' in named.headers['Content-Disposition']
     traversal = client.get(f'{url}?download=1&name=../../etc/passwd')
     assert '/' not in traversal.headers['Content-Disposition'].split('filename=')[1]
     plain = client.get(f'{url}?download=1')

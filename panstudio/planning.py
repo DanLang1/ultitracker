@@ -7,8 +7,18 @@ import numpy as np
 from .models import ProcessingConfig, Sample
 from .calibration import Calibration
 
+PROTECTION_PERSISTENCE = 0.4    # seconds a formation-protection bound must hold before it steers the camera
+EASE_HALF_WIDTH = 0.4           # seconds; zero-phase rounding of the final path, like an operator's hands
+FLIGHT_MIN_BODIES = 12.0        # chord in body heights (about 20 m); shorter throws never move the camera
+FLIGHT_MIN_CHORD_SHARE = 0.2    # fallback, of the frame width, for flights without a body-scaled length
+FLIGHT_HOLD_SECONDS = 2.0       # stay on the landing after the catch
+FLIGHT_FOLLOW_MARGIN = 0.1      # crop-width share kept ahead of receivers still running the throw's way
+FLIGHT_ESCORT_SHARE = 0.6       # a "flight" with a player alongside at its speed this much of the time is that player
+FLIGHT_ESCORT_REACH = 1.5       # body heights between the flight and the player running with it
+FLIGHT_ESCORT_MIN_SPEED = 150.0 # px/s across the frame; slower stretches say nothing (standing players match them)
 
-def apply_deep_coverage(args: ProcessingConfig, records: list[Sample], centers: np.ndarray) -> np.ndarray:
+
+def apply_deep_coverage(args: ProcessingConfig, records: list[Sample], centers: np.ndarray, source_width: int) -> np.ndarray:
     """Keep a persistent runner/defender pair safely visible.
 
     Deep tracking is an optional second objective.  The formation visible to
@@ -21,21 +31,19 @@ def apply_deep_coverage(args: ProcessingConfig, records: list[Sample], centers: 
     if not any(record.get("deep_active") for record in records):
         return centers
 
-    calibration = getattr(args, "calibration", Calibration())
+    calibration = args.calibration
     desired = centers.copy()
     safe_half = args.crop_width / 2 - calibration.deep_margin
-    lookahead = getattr(args, "deep_lookahead", 0.6)
+    lookahead = args.deep_lookahead
     crop_half = args.crop_width / 2
     lower_bounds = np.full(len(records), crop_half)
-    source_width = getattr(args, "frame_width", None)
-    upper_default = float(source_width) - crop_half if source_width is not None else np.inf
-    upper_bounds = np.full(len(records), upper_default)
+    upper_bounds = np.full(len(records), float(source_width) - crop_half)
     for index, record in enumerate(records):
         deep_ids = {int(track_id) for track_id in record.get("deep_track_ids", [])}
         # Protect the extents of credible formation players.  Suppressed,
         # stationary tracks are deliberately omitted: they are often crowd or
         # sideline detections and should not freeze the camera.
-        formation = [] if getattr(args, "no_formation_protection", False) else [
+        formation = [] if args.no_formation_protection else [
             player for player in record.get("players", [])
             if int(player.get("track_id", -1)) not in deep_ids
             and float(player.get("stationary_factor", 1.0)) >= 0.5
@@ -157,17 +165,6 @@ def apply_deep_coverage(args: ProcessingConfig, records: list[Sample], centers: 
     return result
 
 
-PROTECTION_PERSISTENCE = 0.4    # seconds a formation-protection bound must hold before it steers the camera
-EASE_HALF_WIDTH = 0.4           # seconds; zero-phase rounding of the final path, like an operator's hands
-FLIGHT_MIN_BODIES = 12.0        # chord in body heights (about 20 m); shorter throws never move the camera
-FLIGHT_MIN_CHORD_SHARE = 0.2    # fallback, of the frame width, for flights without a body-scaled length
-FLIGHT_HOLD_SECONDS = 2.0       # stay on the landing after the catch
-FLIGHT_FOLLOW_MARGIN = 0.1      # crop-width share kept ahead of receivers still running the throw's way
-FLIGHT_ESCORT_SHARE = 0.6       # a "flight" with a player alongside at its speed this much of the time is that player
-FLIGHT_ESCORT_REACH = 1.5       # body heights between the flight and the player running with it
-FLIGHT_ESCORT_MIN_SPEED = 150.0 # px/s across the frame; slower stretches say nothing (standing players match them)
-
-
 def _escorted(records: list[Sample], times: np.ndarray, flight) -> bool:
     """Whether a player runs alongside the flight at its speed for most of it.
 
@@ -232,7 +229,7 @@ def annotate_flights(records: list[Sample], flights, crop_width: float, frame_wi
     return escorted
 
 
-def apply_flight_targets(args: ProcessingConfig, records: list[Sample], centers: np.ndarray) -> np.ndarray:
+def apply_flight_targets(args: ProcessingConfig, records: list[Sample], centers: np.ndarray, source_width: int) -> np.ndarray:
     """Pan to where a long throw lands, starting at the release.
 
     When the release was seen, the camera holds its path until the disc
@@ -247,7 +244,7 @@ def apply_flight_targets(args: ProcessingConfig, records: list[Sample], centers:
     """
     if not any(record.get("flight_active") for record in records):
         return centers
-    calibration = getattr(args, "calibration", Calibration())
+    calibration = args.calibration
     half = args.crop_width / 2
     desired = centers.copy()
     unseen = np.zeros(len(records), dtype=bool)
@@ -277,18 +274,17 @@ def apply_flight_targets(args: ProcessingConfig, records: list[Sample], centers:
             result[index] = early
     for index in range(1, len(result)):
         result[index] = np.clip(result[index], result[index - 1] - step, result[index - 1] + step)
-    frame_width = getattr(args, "frame_width", None)
-    return np.clip(result, half, frame_width - half) if frame_width else result
+    return np.clip(result, half, source_width - half)
 
 
 def plan_crop_widths(args: ProcessingConfig, records: list[Sample], centers: np.ndarray, source_width: int, source_height: int) -> np.ndarray:
     """Plan restrained variable widths for active deep pairs and disc flights."""
-    calibration = getattr(args, "calibration", Calibration())
+    calibration = args.calibration
     base = float(args.crop_width)
     widths = np.full(len(records), base)
     if not records:
         return widths
-    if getattr(args, "no_auto_widen", False) or getattr(args, "no_deep_tracking", False):
+    if args.no_auto_widen or args.no_deep_tracking:
         return widths
     # Widen only while the original aspect ratio fits inside the footage.
     # A width-only cap can exhaust the source height and introduce black bars.
@@ -369,8 +365,7 @@ def smooth_series(values: np.ndarray, half_width_seconds: float, sample_rate: fl
     return np.convolve(np.pad(values, (half, half), mode="edge"), kernel, mode="valid")
 
 
-def smooth_centers(raw: np.ndarray, crop_width: int, frame_width: int, sample_rate: float, calibration: Calibration | None = None):
-    calibration = calibration or Calibration()
+def smooth_centers(raw: np.ndarray, crop_width: int, frame_width: int, sample_rate: float, calibration: Calibration):
     # Suppress brief detector mistakes (a 1 s median half-width), then soften
     # the operator's aim with a 1.5 s triangular window.
     median_half = max(1, round(1.0 * sample_rate))
@@ -400,30 +395,6 @@ def smooth_centers(raw: np.ndarray, crop_width: int, frame_width: int, sample_ra
 def read_anchor_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as handle:
         return [row for row in csv.DictReader(handle) if any(value.strip() for value in row.values() if value)]
-
-
-def apply_disc_anchors(args: ProcessingConfig, times: np.ndarray, centers: np.ndarray) -> np.ndarray:
-    """Weakly bias framing toward manually identified disc positions plus look room.
-
-    Manual anchors intentionally run after automatic movement limiting so an
-    operator can override the generated camera path when necessary.
-    """
-    if not args.disc_points:
-        return centers
-    result = centers.copy()
-    trend = np.gradient(centers, times, edge_order=1) if len(centers) > 1 else np.zeros_like(centers)
-    for row in read_anchor_csv(args.disc_points):
-        source_time = float(row["source_time_seconds"])
-        relative_time = source_time - args.start
-        disc_x = float(row["disc_x"])
-        nearest = int(np.argmin(np.abs(times - relative_time)))
-        direction_text = (row.get("direction") or "").strip()
-        direction = float(direction_text) if direction_text else float(np.sign(trend[nearest]) or 1)
-        target = disc_x + direction * args.crop_width * args.look_room
-        influence = np.maximum(0.0, 1.0 - np.abs(times - relative_time) / args.disc_radius)
-        blend = args.disc_weight * influence**2
-        result = result * (1.0 - blend) + target * blend
-    return result
 
 
 def apply_manual_corrections(args: ProcessingConfig, times: np.ndarray, centers: np.ndarray) -> np.ndarray:

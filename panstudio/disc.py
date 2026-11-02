@@ -13,13 +13,17 @@ detector pass is needed.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from itertools import islice
 import math
+import os
 import subprocess
 
 import cv2
 import numpy as np
 
+from .media import hwaccel_args, prefetched
 from .models import DetectionSet, ProcessingConfig
 
 # Bump whenever a change alters which flights are found, so saved flights.json
@@ -126,17 +130,18 @@ def _candidates(gray: np.ndarray, median: np.ndarray, blocked: np.ndarray, scale
     The frame may be a 1/scale decode; thresholds shrink accordingly and the
     results are scaled back so every later stage works in source pixels.
     """
-    moving = (np.abs(gray.astype(np.int16) - median) > DIFFERENCE_THRESHOLD).astype(np.uint8)
-    moving[blocked == 0] = 0
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(moving, 8)
+    if median.dtype != np.uint8:
+        median = np.clip(median, 0, 255).astype(np.uint8)
+    moving = cv2.compare(cv2.absdiff(gray, median), DIFFERENCE_THRESHOLD, cv2.CMP_GT)
+    moving = cv2.bitwise_and(moving, moving, mask=blocked)
+    _, _, stats, centroids = cv2.connectedComponentsWithStats(moving, 8)
     min_area, max_area, max_side = MIN_AREA / scale ** 2, MAX_AREA / scale ** 2, MAX_SIDE / scale
-    found = []
-    for i in range(1, count):
-        x, y, w, h, area = stats[i]
-        if min_area <= area <= max_area and max(w, h) <= max_side and max(w, h) <= 6 * max(1, min(w, h)):
-            cx, cy = centroids[i]
-            found.append((float(cx) * scale, float(cy) * scale, int(area * scale ** 2), int(gray[int(cy), int(cx)])))
-    return found
+    w, h, area = stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT], stats[1:, cv2.CC_STAT_AREA]
+    longest = np.maximum(w, h)
+    keep = (min_area <= area) & (area <= max_area) & (longest <= max_side) & (longest <= 6 * np.maximum(1, np.minimum(w, h)))
+    cx, cy = centroids[1:][keep].T
+    intensity = gray[cy.astype(int), cx.astype(int)]
+    return list(zip((cx * scale).tolist(), (cy * scale).tolist(), (area[keep] * scale ** 2).tolist(), intensity.tolist()))
 
 
 class ClutterMap:
@@ -153,13 +158,15 @@ class ClutterMap:
         self.counts = np.zeros((self.rows, self.columns), dtype=np.int32)
         self.history: list[np.ndarray] = []
 
-    def cell(self, x: float, y: float):
-        return min(self.rows - 1, int(y // CLUTTER_CELL)), min(self.columns - 1, int(x // CLUTTER_CELL))
+    def cells(self, found):
+        points = np.array([c[:2] for c in found], dtype=float).reshape(-1, 2)
+        rows = np.minimum(self.rows - 1, (points[:, 1] // CLUTTER_CELL).astype(int))
+        columns = np.minimum(self.columns - 1, (points[:, 0] // CLUTTER_CELL).astype(int))
+        return rows, columns
 
     def update(self, found):
         cells = np.zeros((self.rows, self.columns), dtype=bool)
-        for x, y, *_ in found:
-            cells[self.cell(x, y)] = True
+        cells[self.cells(found)] = True
         self.history.append(cells)
         self.counts += cells
         if len(self.history) > CLUTTER_WINDOW:
@@ -168,9 +175,10 @@ class ClutterMap:
     def split(self, found):
         """(clean candidates, candidates inside clutter cells)."""
         limit = CLUTTER_FRACTION * len(self.history)
+        is_clean = self.counts[self.cells(found)] <= limit
         clean, cluttered = [], []
-        for c in found:
-            (clean if self.counts[self.cell(c[0], c[1])] <= limit else cluttered).append(c)
+        for c, ok in zip(found, is_clean.tolist()):
+            (clean if ok else cluttered).append(c)
         return clean, cluttered
 
 
@@ -184,28 +192,29 @@ class Linker:
 
     def step(self, frame: int, found, cluttered=()):
         """Extend tracks with clean candidates, or through clutter under a tight gate; seed only from clean ones."""
-        used = set()
         kept = []
         pool = list(found) + list(cluttered)
         clean_count = len(found)
+        candidates = np.array(pool, dtype=float).reshape(-1, 4)
+        xs, ys, areas, intensities = candidates.T
+        is_clean = np.arange(len(pool)) < clean_count
+        used = np.zeros(len(pool), dtype=bool)
         for track in self.active:
             gap = frame - track['frame']
             vx, vy = track['v']
             px, py = track['x'] + vx * gap, track['y'] + vy * gap
             speed = math.hypot(vx, vy)
             best = None
-            for j, (cx, cy, area, intensity) in enumerate(pool):
-                if j in used:
-                    continue
-                if not (track['area'] / AREA_RATIO <= area <= track['area'] * AREA_RATIO) or abs(intensity - track['intensity']) > INTENSITY_STEP:
-                    continue
-                gate = (25.0 + 0.35 * speed * gap) if j < clean_count else (10.0 + 0.15 * speed * gap)
-                distance = math.hypot(cx - px, cy - py)
-                if distance < gate and (best is None or distance < best[0]):
-                    best = (distance, j)
+            if len(pool):
+                gate = np.where(is_clean, 25.0 + 0.35 * speed * gap, 10.0 + 0.15 * speed * gap)
+                distance = np.hypot(xs - px, ys - py)
+                eligible = (~used & (track['area'] / AREA_RATIO <= areas) & (areas <= track['area'] * AREA_RATIO)
+                            & (np.abs(intensities - track['intensity']) <= INTENSITY_STEP) & (distance < gate))
+                if eligible.any():
+                    best = int(np.flatnonzero(eligible)[np.argmin(distance[eligible])])
             if best is not None:
-                j = best[1]
-                used.add(j)
+                j = best
+                used[j] = True
                 cx, cy, area, intensity = pool[j]
                 ovx, ovy = (cx - track['x']) / gap, (cy - track['y']) / gap
                 track['v'] = (0.5 * vx + 0.5 * ovx, 0.5 * vy + 0.5 * ovy)
@@ -217,17 +226,21 @@ class Linker:
                 kept.append(track)
             elif len(track['points']) >= MIN_FRAMES:
                 self.done.append(track)
-        for j, (cx, cy, area, intensity) in enumerate(found):
-            if j in used:
-                continue
-            for (lx, ly, larea, lintensity) in self.previous:
-                displacement = math.hypot(cx - lx, cy - ly)
-                if SEED_MIN <= displacement <= SEED_MAX and larea / AREA_RATIO <= area <= larea * AREA_RATIO \
-                        and abs(intensity - lintensity) <= INTENSITY_STEP:
-                    kept.append({'x': cx, 'y': cy, 'v': (cx - lx, cy - ly), 'frame': frame, 'area': area,
-                                 'intensity': intensity, 'points': [(frame - 1, lx, ly, larea), (frame, cx, cy, area)]})
-                    break
-        self.previous = [c for j, c in enumerate(found) if j not in used]
+        if clean_count and self.previous:
+            # Each unused clean candidate seeds from the first previous candidate that fits.
+            previous = np.array(self.previous, dtype=float)
+            fresh = candidates[:clean_count]
+            displacement = np.hypot(fresh[:, None, 0] - previous[None, :, 0], fresh[:, None, 1] - previous[None, :, 1])
+            fits = ((SEED_MIN <= displacement) & (displacement <= SEED_MAX)
+                    & (previous[None, :, 2] / AREA_RATIO <= fresh[:, None, 2]) & (fresh[:, None, 2] <= previous[None, :, 2] * AREA_RATIO)
+                    & (np.abs(fresh[:, None, 3] - previous[None, :, 3]) <= INTENSITY_STEP))
+            fits[used[:clean_count]] = False
+            for j in np.flatnonzero(fits.any(axis=1)).tolist():
+                cx, cy, area, intensity = found[j]
+                lx, ly, larea, _ = self.previous[int(np.argmax(fits[j]))]
+                kept.append({'x': cx, 'y': cy, 'v': (cx - lx, cy - ly), 'frame': frame, 'area': area,
+                             'intensity': intensity, 'points': [(frame - 1, lx, ly, larea), (frame, cx, cy, area)]})
+        self.previous = [c for j, c in enumerate(found) if not used[j]]
         self.active = kept
 
     def finish(self):
@@ -363,6 +376,24 @@ def _merge(flights: list[Flight]) -> list[Flight]:
     return kept
 
 
+def _chunk_median(chunk: list[np.ndarray], pool: ThreadPoolExecutor, strips: int) -> np.ndarray:
+    """Per-pixel median of every third frame, computed in row strips across the pool."""
+    stack = np.stack(chunk[::3])
+    bounds = np.linspace(0, stack.shape[1], strips + 1).astype(int)
+    medians = pool.map(lambda rows: np.median(stack[:, rows[0]:rows[1]], axis=0), zip(bounds[:-1], bounds[1:]))
+    return np.concatenate(list(medians)).astype(np.uint8)
+
+
+def _gray_frames(command: list[str], frame_bytes: int, shape: tuple[int, int]):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE)
+    try:
+        while len(data := process.stdout.read(frame_bytes)) == frame_bytes:
+            yield np.frombuffer(data, dtype=np.uint8).reshape(shape)
+    finally:
+        process.stdout.close()
+        process.wait()
+
+
 def detect_flights(config: ProcessingConfig, video, detections: DetectionSet, play_area: np.ndarray | None,
                    progress=None, scale: int = SCAN_SCALE) -> list[Flight]:
     """Scan the configured range at full frame rate, decoding at 1/scale."""
@@ -371,37 +402,38 @@ def detect_flights(config: ProcessingConfig, video, detections: DetectionSet, pl
     allowed, tops = allowed_region(play_area, height, width)
     low_width, low_height = width // scale, height // scale
     allowed_low = cv2.resize(allowed, (low_width, low_height), interpolation=cv2.INTER_NEAREST)
-    command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', str(config.start), '-i', str(config.input),
+    command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', *hwaccel_args(), '-ss', str(config.start), '-i', str(config.input),
                '-frames:v', str(total), '-an', '-sn', '-dn', '-vf', f'scale={low_width}:{low_height}',
                '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1']
-    process = subprocess.Popen(command, stdout=subprocess.PIPE)
+    frames = prefetched(_gray_frames(command, low_width * low_height, (low_height, low_width)), depth=CHUNK_FRAMES)
     linker = Linker()
     clutter = ClutterMap(height, width)
     times = _sample_times(detections)
-    frame_bytes = low_width * low_height
     frame_index = 0
+    # Candidates depend only on their own frame, so a chunk's frames are
+    # searched in parallel; linking them into tracks stays sequential.
+    workers = min(8, os.cpu_count() or 1)
+    pool = ThreadPoolExecutor(workers)
+
+    def frame_candidates(index, gray, median):
+        blocked = allowed_low.copy()
+        blocked[person_mask(detections, times, index / fps, low_height, low_width, scale) > 0] = 0
+        return _candidates(gray, median, blocked, scale)
+
     try:
         while frame_index < total:
-            chunk = []
-            for _ in range(min(CHUNK_FRAMES, total - frame_index)):
-                data = process.stdout.read(frame_bytes)
-                if len(data) < frame_bytes:
-                    break
-                chunk.append(np.frombuffer(data, dtype=np.uint8).reshape(low_height, low_width))
+            chunk = list(islice(frames, min(CHUNK_FRAMES, total - frame_index)))
             if not chunk:
                 break
-            median = np.median(np.stack(chunk[::3]), axis=0).astype(np.int16)
-            for gray in chunk:
-                t = frame_index / fps
-                blocked = allowed_low.copy()
-                blocked[person_mask(detections, times, t, low_height, low_width, scale) > 0] = 0
-                found = _candidates(gray, median, blocked, scale)
+            median = _chunk_median(chunk, pool, workers)
+            indices = range(frame_index, frame_index + len(chunk))
+            for found in pool.map(frame_candidates, indices, chunk, [median] * len(chunk)):
                 clutter.update(found)
                 linker.step(frame_index, *clutter.split(found))
                 frame_index += 1
             if progress:
                 progress(frame_index, total)
     finally:
-        process.stdout.close()
-        process.wait()
+        pool.shutdown(cancel_futures=True)
+        frames.close()
     return _qualify(linker.finish(), detections, fps, play_area, tops)

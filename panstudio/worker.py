@@ -1,4 +1,5 @@
 """A bounded single-worker queue, retaining subprocess isolation for inference."""
+import json
 import os
 from pathlib import Path
 import queue
@@ -6,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from .artifacts import flights_version, load_detections
@@ -100,14 +102,14 @@ class JobRunner:
                     break
             if metadata.get('generate_debug'):
                 command.append('--debug')
-            if not metadata.get('auto_widen', True):
-                command.append('--no-auto-widen')
             if self.calibration:
                 command.extend(['--calibration', str(self.calibration)])
             environment = os.environ.copy()
             environment.update(PYTHONUNBUFFERED='1', YOLO_CONFIG_DIR=str(directory / '.ultralytics'),
                                MPLCONFIGDIR=str(directory / '.matplotlib'))
-            if not self.store.transition(job_id, run_id, 'processing', progress=1, message='Starting player analysis…'):
+            started = time.time()
+            if not self.store.transition(job_id, run_id, 'processing', progress=1, message='Starting player analysis…',
+                                         started_at=started, stage=None, stage_started_at=started, stage_fraction=0.0):
                 return
             with (output / 'process.log').open('w') as log:
                 with self.lock:
@@ -136,8 +138,13 @@ class JobRunner:
                     raise RuntimeError(detail or f'Processor did not complete (exit status {return_code}). See the job log.')
             if not (output / 'tactical-crop.mp4').is_file():
                 raise RuntimeError('Processor completed without an output video.')
-            result = {'progress': 100, 'message': 'Your tactical video is ready.',
+            result = {'progress': 100, 'message': 'Your tactical video is ready.', 'finished_at': time.time(),
                       'output_url': f'/jobs/{job_id}/runs/{run_id}/tactical-crop.mp4'}
+            try:
+                timings = json.loads((output / 'timings.json').read_text())
+                result['timings'] = {'total_seconds': timings['total_seconds'], 'stages': timings['stages']}
+            except (OSError, ValueError, KeyError):
+                pass
             if metadata.get('generate_debug'):
                 if not (output / 'debug-wide.mp4').is_file():
                     raise RuntimeError('Processor completed without the requested review video.')
@@ -171,7 +178,10 @@ class JobRunner:
             message = 'Rendering the tactical crop…'
         else:
             return
-        self.store.transition(job_id, run_id, 'processing', progress=progress, message=event.message or message)
+        timing = {'stage': event.stage, 'stage_fraction': round(fraction, 4)}
+        if event.stage != self.store.get(job_id).status.get('stage'):
+            timing['stage_started_at'] = event.time or time.time()
+        self.store.transition(job_id, run_id, 'processing', progress=progress, message=event.message or message, **timing)
 
     @staticmethod
     def _terminate(process):

@@ -13,7 +13,8 @@ from .artifacts import atomic_json, flights_version, load_detections, load_fligh
 from .events import report
 from .masking import load_play_area_mask, save_mask_preview
 from .models import DEFAULT_MODEL, DEVICES, ProcessingConfig
-from .pipeline import detect, plan_camera, probe_video, render_plan, validate_reuse, validate_video
+from .pipeline import detect, plan_camera, probe_video, render_plan, select_device, validate_reuse, validate_video
+from .timing import StageTimer, machine_info
 
 
 def parse_args(argv=None):
@@ -54,7 +55,7 @@ def parse_args(argv=None):
     reuse.add_argument("--plan-in", type=Path, help="Render an existing camera plan without detection or planning")
     parser.add_argument("--calibration", type=Path, help="JSON camera calibration overrides")
     parser.add_argument("--device", choices=DEVICES, default="auto",
-                        help="Inference device; auto uses the Apple GPU (mps) when available")
+                        help="Inference device; auto uses an NVIDIA (cuda) or Apple (mps) GPU when available")
     parser.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
     options = parser.parse_args(argv)
     if options.plan_in and (options.detect_only or options.preview_mask_only or options.analysis_only):
@@ -127,36 +128,58 @@ def watch_parent():
     threading.Thread(target=watch, daemon=True, name='parent-watchdog').start()
 
 
-def run(config, options, video) -> str:
+def run(config, options, video, timer=None) -> str:
     """Run the requested stages and return the completion message."""
+    timer = timer or StageTimer()
     if options.plan_in:
         plan = load_plan(options.plan_in)
         validate_reuse(config, plan, video)
         validate_video(replace(config, crop_width=plan.crop_width, crop_height=plan.crop_height), video)
-        render_plan(config, plan)
+        with timer.stage('render'):
+            render_plan(config, plan)
         return f'Outputs are in {config.output_dir}'
     if options.detect_only:
         validate_video(config, video, check_crop=False)
-        save_detections(config.output_dir / 'detections.json', detect(config, video))
+        with timer.stage('detection'):
+            save_detections(config.output_dir / 'detections.json', detect(config, video))
         return 'Saved raw detections'
     validate_video(config, video)
-    mask = play_area_mask(config, video) if config.play_area else None
+    with timer.stage('mask'):
+        mask = play_area_mask(config, video) if config.play_area else None
     if options.preview_mask_only:
         if mask is None:
             raise ValueError('--preview-mask-only requires --play-area')
         return 'Saved mask preview'
-    if options.detections_in:
-        detections = load_detections(options.detections_in)
-        validate_reuse(config, detections, video)
-        report('detection', len(detections.samples), len(detections.samples), 'Reusing saved detections')
-    else:
-        detections = detect(config, video)
-    save_detections(config.output_dir / 'detections.json', detections)
-    plan = plan_camera(config, detections, mask, flights_for(config, options, video, detections, mask))
-    export_plan(config.output_dir, plan)
+    with timer.stage('detection'):
+        if options.detections_in:
+            detections = load_detections(options.detections_in)
+            validate_reuse(config, detections, video)
+            report('detection', len(detections.samples), len(detections.samples), 'Reusing saved detections')
+        else:
+            detections = detect(config, video)
+        save_detections(config.output_dir / 'detections.json', detections)
+    with timer.stage('disc'):
+        flights = flights_for(config, options, video, detections, mask)
+    with timer.stage('planning'):
+        plan = plan_camera(config, detections, mask, flights)
+        export_plan(config.output_dir, plan)
     if not options.analysis_only:
-        render_plan(config, plan)
+        with timer.stage('render'):
+            render_plan(config, plan)
     return f'Outputs are in {config.output_dir}'
+
+
+def save_timings(config, options, video, timer):
+    """Record how long each stage took, on what hardware, and what was reused rather than recomputed."""
+    atomic_json(config.output_dir / 'timings.json', {
+        **timer.summary(),
+        'footage_seconds': round(config.end - config.start, 3),
+        'video': {'width': video.width, 'height': video.height, 'fps': video.fps},
+        'start': config.start, 'end': config.end, 'sample_rate': config.sample_rate, 'model': config.model,
+        'play_area': config.play_area is not None, 'debug': config.debug,
+        'reused': {'detections': bool(options.detections_in), 'flights': bool(options.flights_in), 'plan': bool(options.plan_in)},
+        'machine': machine_info(select_device(config.device)),
+    })
 
 
 def main(argv=None):
@@ -166,7 +189,11 @@ def main(argv=None):
             watch_parent()
         config = ProcessingConfig.from_namespace(options)
         config.output_dir.mkdir(parents=True, exist_ok=True)
-        report('complete', 1, 1, run(config, options, probe_video(config.input)))
+        timer = StageTimer()
+        video = probe_video(config.input)
+        message = run(config, options, video, timer)
+        save_timings(config, options, video, timer)
+        report('complete', 1, 1, message)
     except Exception as error:
         report('error', message=str(error))
         raise

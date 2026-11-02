@@ -81,10 +81,6 @@
               <input id="debug-toggle" type="checkbox" />
               <span><b>Generate debug review video</b><small>Adds a full-width detection overlay and takes longer.</small></span>
             </label>
-            <label class="debug-option">
-              <input id="auto-widen-toggle" type="checkbox" checked />
-              <span><b>Allow gentle widening</b><small>Keeps spread-out action visible with a limited, gradual zoom out.</small></span>
-            </label>
           </div>
           <div class="actions"><button class="button ghost" id="edit-area">Adjust active area</button><button class="button primary large" id="process-button">Process video</button></div>
         </div>
@@ -92,9 +88,11 @@
           <p class="process-message" id="process-message">Starting player analysis…</p>
           <div class="progress-track large-track"><div id="process-bar"></div></div>
           <p class="muted"><span id="process-percent">0%</span> · You can close this tab and come back; keep the local server running.</p>
+          <p class="muted" id="process-timing"></p>
         </div>
         <div id="process-complete" class="complete-state hidden">
           <video id="output-video" controls playsinline></video>
+          <p class="muted" id="process-timings"></p>
           <div class="actions end-actions">
             <button class="button ghost" id="adjust-settings">Adjust settings</button>
             <a class="button ghost hidden" id="debug-download">Download review video</a>

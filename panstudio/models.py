@@ -9,7 +9,7 @@ import math
 from .calibration import Calibration
 
 
-DEVICES = ('auto', 'cpu', 'mps')
+DEVICES = ('auto', 'cpu', 'cuda', 'mps')
 DEFAULT_MODEL = 'yolo11s.pt'
 
 

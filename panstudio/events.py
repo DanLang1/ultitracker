@@ -1,6 +1,7 @@
 """Versioned JSON-lines worker protocol, independent of human log wording."""
 from dataclasses import asdict, dataclass
 import json
+import time
 
 
 @dataclass(frozen=True)
@@ -10,6 +11,7 @@ class ProgressEvent:
     total: int = 0
     message: str = ''
     protocol: str = 'tactical-pan/v1'
+    time: float = 0.0  # Unix seconds when emitted; 0 for events from older workers
 
     @classmethod
     def parse(cls, line: str):
@@ -20,7 +22,8 @@ class ProgressEvent:
             event = cls(**data)
             if event.stage not in {'detection', 'disc', 'planning', 'debug', 'render', 'complete', 'error'}:
                 return None
-            if type(event.completed) is not int or type(event.total) is not int or not isinstance(event.message, str):
+            if type(event.completed) is not int or type(event.total) is not int or not isinstance(event.message, str) \
+                    or type(event.time) not in (int, float):
                 return None
             if not 0 <= event.completed <= event.total:
                 return None
@@ -30,4 +33,4 @@ class ProgressEvent:
 
 
 def report(stage: str, completed: int = 0, total: int = 0, message: str = ''):
-    print(json.dumps(asdict(ProgressEvent(stage, completed, total, message))), flush=True)
+    print(json.dumps(asdict(ProgressEvent(stage, completed, total, message, time=round(time.time(), 3)))), flush=True)

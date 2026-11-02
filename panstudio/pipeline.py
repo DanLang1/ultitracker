@@ -7,7 +7,7 @@ import numpy as np
 
 from .artifacts import source_identity
 from .events import report
-from .media import render, sampled_analysis_frames
+from .media import prefetched, render, sampled_analysis_frames
 from .models import CameraPlan, Detection, DetectionSample, DetectionSet, DetectorSettings, ProcessingConfig, Sample, VideoInfo
 from .planning import annotate_flights, apply_crop_geometry, apply_deep_coverage, apply_flight_targets, apply_manual_corrections, smooth_centers
 from .tracking import calculate_raw_centers, identify_deep_pairs, select_field_players, suppress_bystanders, suppress_stationary_tracks
@@ -41,7 +41,7 @@ def detector_settings(config: ProcessingConfig) -> DetectorSettings:
 
 
 def select_device(requested: str = 'auto') -> str:
-    """Resolve 'auto' to the Apple GPU when PyTorch can use it, otherwise the CPU.
+    """Resolve 'auto' to an NVIDIA or Apple GPU when PyTorch can use one, otherwise the CPU.
 
     The device only changes inference speed, not the detector settings that
     decide whether saved detections can be reused.
@@ -49,6 +49,8 @@ def select_device(requested: str = 'auto') -> str:
     if requested != 'auto':
         return requested
     import torch
+    if torch.cuda.is_available():
+        return 'cuda'
     return 'mps' if torch.backends.mps.is_available() else 'cpu'
 
 
@@ -61,7 +63,7 @@ def detect(config: ProcessingConfig, video: VideoInfo, model=None) -> DetectionS
     report('detection', 0, 1, f'Running inference on {device}')
     sample_times = np.arange(config.start, config.end + 1e-6, 1 / config.sample_rate)
     samples = []
-    for index, timestamp, frame in sampled_analysis_frames(config, video.width, video.height, sample_times):
+    for index, timestamp, frame in prefetched(sampled_analysis_frames(config, video.width, video.height, sample_times)):
         result = model.predict(frame, imgsz=config.inference_size, conf=config.confidence,
                                iou=0.45, classes=[0], device=device, verbose=False)[0]
         boxes = result.boxes.xyxy.cpu().numpy()

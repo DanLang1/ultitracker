@@ -883,6 +883,32 @@ def test_flight_qualification_accepts_a_low_far_sideline_arc_but_not_traffic():
     assert _qualify([{'points': car}], detections, 20.0, mask, tops) == []
 
 
+def test_disc_candidates_keep_small_unblocked_movers_in_source_units():
+    from panstudio.disc import _candidates
+    gray = np.zeros((400, 600), np.uint8)
+    median = np.zeros((400, 600), np.int16)
+    gray[50:54, 100:104] = 200       # a disc-sized blob
+    gray[200:300, 300:400] = 200     # a person-sized blob
+    gray[20:24, 500:504] = 200       # a disc-sized blob under a person box
+    gray[350:352, 10:30] = 200       # a streak too elongated to be a disc
+    blocked = np.full((400, 600), 255, np.uint8)
+    blocked[10:40, 490:520] = 0
+    assert _candidates(gray, median, blocked, scale=2) == [(203.0, 103.0, 64, 200)]
+
+
+def test_disc_linker_follows_a_steady_mover_and_ignores_clutter_seeds():
+    from panstudio.disc import ClutterMap, Linker
+    linker, clutter = Linker(), ClutterMap(1728, 4608)
+    for frame in range(12):
+        disc = (500.0 + 40 * frame, 800.0 - 10 * frame, 60, 180)
+        noise = (3000.0 + 30 * frame, 1500.0, 60, 180)  # moves like a disc but only ever offered as clutter
+        clutter.update([disc])
+        linker.step(frame, [disc], [noise])
+    tracks = linker.finish()
+    assert len(tracks) == 1
+    assert [p[1] for p in tracks[0]['points']] == [500.0 + 40 * f for f in range(12)]
+
+
 def test_single_sample_protection_flicker_does_not_yank_the_camera():
     """A deep pair runs right. One far-left detection appears for a single sample; the camera must not dip."""
     rate = 5.0
@@ -911,3 +937,32 @@ def test_ease_path_rounds_corners_without_delay_or_overshoot():
     assert eased.min() >= 1000 - 1e-9 and eased.max() <= 2000 + 1e-9
     assert np.max(np.abs(np.diff(eased, 2))) < np.max(np.abs(np.diff(path, 2)))
     assert abs(eased[25] - path[25]) < 1e-6   # mid-pan is untouched: zero phase
+
+
+def test_prefetched_preserves_order_and_propagates_errors():
+    from panstudio.media import prefetched
+
+    assert list(prefetched(iter(range(20)), depth=2)) == list(range(20))
+
+    def failing():
+        yield 1
+        raise RuntimeError("decoder failed")
+
+    results = []
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        for item in prefetched(failing()):
+            results.append(item)
+    assert results == [1]
+
+    closed = []
+
+    def endless():
+        try:
+            while True:
+                yield 0
+        finally:
+            closed.append(True)
+
+    for _ in prefetched(endless(), depth=1):
+        break
+    assert closed == [True]

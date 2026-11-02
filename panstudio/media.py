@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import functools
+import queue
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 import cv2
 import numpy as np
@@ -15,6 +18,19 @@ def extract_frame(source: Path, time: float, output: Path, width: int):
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", str(time), "-i", str(source),
         "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "2", str(output),
     ], check=True, capture_output=True)
+
+
+@functools.cache
+def hwaccel_args() -> list[str]:
+    """Decode on an NVIDIA GPU when one is reachable; FFmpeg falls back to software per stream."""
+    try:
+        usable = subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-init_hw_device", "cuda",
+            "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1", "-f", "null", "-",
+        ], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        usable = False
+    return ["-hwaccel", "cuda"] if usable else []
 
 
 def letterbox_crop(frame: np.ndarray, crop_x: int, crop_y: int, crop_width: int, crop_height: int, out_width: int, out_height: int) -> np.ndarray:
@@ -35,7 +51,7 @@ def letterbox_crop(frame: np.ndarray, crop_x: int, crop_y: int, crop_width: int,
 def analysis_decoder_command(args: ProcessingConfig, sample_count: int) -> list[str]:
     """Decode analysis samples in one pass instead of seeking for every frame."""
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", *hwaccel_args(),
         "-ss", str(args.start), "-i", str(args.input),
         "-vf", f"fps={args.sample_rate}:start_time=0",
         "-frames:v", str(sample_count),
@@ -87,6 +103,48 @@ def sampled_analysis_frames(args: ProcessingConfig, width: int, height: int, sam
             raise RuntimeError(error or f"FFmpeg analysis decoder exited with status {return_code}")
 
 
+def prefetched(items, depth: int = 4):
+    """Iterate on a background thread so decoding overlaps with the consumer's work."""
+    buffer = queue.Queue(depth)
+    stop = threading.Event()
+    finished = object()
+
+    def put(entry):
+        while not stop.is_set():
+            try:
+                buffer.put(entry, timeout=0.1)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def produce():
+        try:
+            for item in items:
+                if not put((None, item)):
+                    break
+        except BaseException as error:
+            put((error, None))
+        finally:
+            if hasattr(items, 'close'):
+                items.close()
+            put((None, finished))
+
+    thread = threading.Thread(target=produce, daemon=True)
+    thread.start()
+    try:
+        while True:
+            error, item = buffer.get()
+            if error is not None:
+                raise error
+            if item is finished:
+                return
+            yield item
+    finally:
+        stop.set()
+        thread.join()
+
+
 def frame_rate_path(records: list[Sample], sample_times: np.ndarray, frame_times: np.ndarray,
                     default_width: float, default_height: float):
     """Resample the planned crop to frame rate without velocity kinks.
@@ -112,6 +170,25 @@ def frame_rate_path(records: list[Sample], sample_times: np.ndarray, frame_times
     return tuple(np.convolve(np.pad(s, (half, half), mode="edge"), kernel, mode="valid") for s in series)
 
 
+@functools.cache
+def nvenc_available() -> bool:
+    """FFmpeg can list h264_nvenc without a usable NVIDIA driver, so try a tiny encode."""
+    try:
+        return subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
+            "-c:v", "h264_nvenc", "-f", "null", "-",
+        ], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def video_codec_args(width: int, height: int) -> list[str]:
+    # NVENC rejects frames below 145x49; tiny renders are cheap on the CPU anyway.
+    if width >= 256 and height >= 256 and nvenc_available():
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+
+
 def encoder_command(args: ProcessingConfig, output: Path, width: int, height: int, fps: float):
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -119,7 +196,7 @@ def encoder_command(args: ProcessingConfig, output: Path, width: int, height: in
         "-r", f"{fps:.8f}", "-i", "pipe:0",
         "-ss", str(args.start), "-t", str(args.end - args.start), "-i", str(args.input),
         "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+        *video_codec_args(width, height),
         "-c:a", "aac", "-b:a", "128k", "-shortest", str(output),
     ]
 

@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import atexit
 import fcntl
+import platform
+import subprocess
 from functools import wraps
 import shutil
 import threading
+import time
 import uuid
 import webbrowser
 from pathlib import Path
@@ -53,7 +56,6 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
             'job_id': job.id, 'filename': metadata['filename'],
             'width': metadata['width'], 'height': metadata['height'],
             'duration': metadata['duration'], 'size': metadata['size'],
-            'auto_widen': metadata.get('auto_widen', True),
             'generate_debug': metadata.get('generate_debug', False),
             'has_mask': (directory / 'active-area-mask.png').is_file(),
             'frame_url': f'/jobs/{job.id}/active-area-frame.jpg',
@@ -101,7 +103,7 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
             extract_frame(video_path, preview_time, directory / 'active-area-frame.jpg', width=1600)
             metadata = {'width': video.width, 'height': video.height, 'duration': video.duration,
                         'size': video_path.stat().st_size, 'job_id': job_id, 'filename': filename,
-                        'video_path': str(video_path.resolve()), 'auto_widen': True}
+                        'video_path': str(video_path.resolve())}
             store.create(job_id, metadata)
         except Exception as error:
             shutil.rmtree(directory, ignore_errors=True)
@@ -143,15 +145,16 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
         payload = request.get_json(silent=True) or {}
         if not isinstance(payload, dict):
             raise ValueError('Expected an object containing processing options.')
-        debug, auto_widen = payload.get('debug', False), payload.get('auto_widen', True)
-        if type(debug) is not bool or type(auto_widen) is not bool:
+        debug = payload.get('debug', False)
+        if type(debug) is not bool:
             raise ValueError('Processing options must be booleans.')
-        return jsonify(runner.submit(job_id, {'generate_debug': debug, 'auto_widen': auto_widen}))
+        return jsonify(runner.submit(job_id, {'generate_debug': debug}))
 
     @app.get('/api/status/<job_id>')
     @api_errors
     def processing_status(job_id):
-        return jsonify(store.get(job_id).status)
+        # The browser's clock may differ from the server's (WSL drifts after sleep), so elapsed time uses this one.
+        return jsonify({**store.get(job_id).status, 'server_time': time.time()})
 
     @app.delete('/api/jobs/<job_id>')
     @api_errors
@@ -171,6 +174,15 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
                                    download_name=name or None, conditional=True)
 
     return app
+
+
+def open_browser(url: str):
+    # Under WSL the server is reachable from Windows at the same localhost URL,
+    # but Python's webbrowser only knows Linux browsers.
+    if 'microsoft' in platform.release().lower() and shutil.which('cmd.exe'):
+        subprocess.run(['cmd.exe', '/c', 'start', '', url], cwd='/mnt/c', capture_output=True)
+    else:
+        webbrowser.open(url)
 
 
 def parse_args():
@@ -196,7 +208,7 @@ def main():
         atexit.register(runner.close)
         url = f'http://127.0.0.1:{arguments.port}'
         if not arguments.no_browser:
-            threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+            threading.Timer(0.8, open_browser, (url,)).start()
         print(f'Tactical Pan Studio is running at {url}')
         try:
             app.run(host='127.0.0.1', port=arguments.port, debug=False, threaded=True)

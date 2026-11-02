@@ -45,8 +45,11 @@ uv sync
 The first run downloads the YOLO model weights (`yolo11s.pt` by default) into
 this directory. The small model (`--model yolo11n.pt`) is about twice as fast
 but misses more of the smallest far-sideline players.
-Detection runs on the Apple GPU (PyTorch MPS) when it is available, which is
-several times faster than the CPU on Apple silicon. Pass `--device cpu` to the
+Detection runs on an NVIDIA GPU (CUDA) or the Apple GPU (PyTorch MPS) when one
+is available, which is several times faster than the CPU. Rendering uses NVENC
+hardware encoding when FFmpeg can reach an NVIDIA GPU and falls back to libx264
+otherwise. Under WSL2, `uv run python gui.py` opens the GUI in your Windows
+browser; the server is reachable from Windows at the same localhost URL. Pass `--device cpu` to the
 CLI to force CPU inference; the GUI always uses automatic selection. The device
 does not affect detection reuse.
 
@@ -173,8 +176,8 @@ zooming. Expansion is limited to 280 source pixels per second and contraction
 to 220. These transitions can extend before and after a deep signal; sequences
 without deep signals stay at the normal width.
 
-**Allow gentle widening** is enabled by default in the processing screen.
-Uncheck it, or use `--no-auto-widen`, to keep the normal crop width.
+The GUI always applies gentle widening. On the command line, `--no-auto-widen`
+keeps the normal crop width for A/B comparisons.
 `pan-path.csv` and `analysis.json` include each sample's crop width, height,
 and position, and the debug video shows the actual variable crop.
 
@@ -242,6 +245,28 @@ The default profile preserves the original thresholds at its reference size.
 Resizing a camera view is supported by this scaling; a different perspective
 still needs an operator mask or a calibrated sideline profile. Crop and output
 sizes remain explicit CLI options, with 2560×1440 defaults.
+
+## Timing and benchmarks
+
+Every run writes `timings.json` next to its outputs: wall-clock seconds per stage
+(mask, detection, disc, planning, render), the total, what was reused, and the
+machine (CPU, GPU, inference device, and whether FFmpeg decoded on the GPU and
+encoded with NVENC). Progress events also carry a timestamp. The GUI shows the
+elapsed time and the time left in the current stage while processing, and the
+per-stage breakdown when a video is ready.
+
+To compare machines or commits, run the same clip through every stage:
+
+```bash
+uv run python benchmark.py /path/to/vsfuse.mp4 --play-area benchmarks/vsfuse-field.png --label macbook-air
+```
+
+It processes five minutes from 10:00 by default (`--start`, `--duration`) in a
+fresh temporary folder, so nothing is reused, appends a record to
+`benchmarks/results.jsonl` (including the commit and seconds per minute of
+footage), and prints every recorded run of that clip side by side.
+`benchmarks/vsfuse-field.png` is the field outline drawn for the reference
+footage; use the same video file and mask on each machine.
 
 ## Code structure and tests
 

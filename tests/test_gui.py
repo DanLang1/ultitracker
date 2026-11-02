@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -45,12 +46,11 @@ def application(tmp_path):
 def test_process_claims_once_and_persists_options(application):
     client = application.test_client()
     job_id = 'a' * 32
-    first = client.post(f'/api/process/{job_id}', json={'debug': False, 'auto_widen': False})
+    first = client.post(f'/api/process/{job_id}', json={'debug': False})
     second = client.post(f'/api/process/{job_id}', json={'debug': True})
     assert first.json['state'] == second.json['state'] == 'queued'
     assert application.extensions['job_runner'].calls == 1
     metadata = application.extensions['job_store'].get(job_id).metadata
-    assert metadata['auto_widen'] is False
     assert metadata['generate_debug'] is False
 
 
@@ -129,11 +129,11 @@ def test_queue_is_bounded_serial_and_duplicate_safe(tmp_path):
 def test_worker_uses_structured_events_and_requires_output(application):
     store = application.extensions['job_store']
     job_id, run_id = 'a' * 32, 'b' * 32
-    store.claim(job_id, {'auto_widen': False}, run_id)
+    store.claim(job_id, {'auto_widen': False}, run_id)  # saved before widening became mandatory
     runner = JobRunner(store, Path(__file__).resolve().parents[1])
     class Process:
         def __init__(self, command, **kwargs):
-            assert '--no-auto-widen' in command
+            assert '--no-auto-widen' not in command
             output = Path(command[command.index('--output-dir') + 1])
             (output / 'tactical-crop.mp4').write_bytes(b'output')
             self.stdout = io.StringIO('Human wording can change completely\n' + json.dumps(ProgressEvent('render', 1, 2).__dict__) + '\n' + json.dumps(ProgressEvent('complete', 1, 1).__dict__) + '\n')
@@ -147,6 +147,45 @@ def test_worker_uses_structured_events_and_requires_output(application):
     assert result['state'] == 'complete'
     assert result['progress'] == 100
     assert f'/runs/{run_id}/' in result['output_url']
+
+
+def test_worker_tracks_stage_timing_and_attaches_final_timings(application):
+    store = application.extensions['job_store']
+    job_id, run_id = 'a' * 32, 'b' * 32
+    store.claim(job_id, {}, run_id)
+    runner = JobRunner(store, Path(__file__).resolve().parents[1])
+    seen = []
+    original = store.transition
+    def recording(*args, **kwargs):
+        result = original(*args, **kwargs)
+        seen.append(dict(store.get(job_id).status))
+        return result
+    class Process:
+        def __init__(self, command, **kwargs):
+            output = Path(command[command.index('--output-dir') + 1])
+            (output / 'tactical-crop.mp4').write_bytes(b'output')
+            (output / 'timings.json').write_text(json.dumps({'total_seconds': 90.5, 'stages': {'detection': 60.0, 'render': 30.0}, 'machine': {}}))
+            events = [ProgressEvent('detection', 1, 4, time=1000.0), ProgressEvent('detection', 2, 4, time=1010.0),
+                      ProgressEvent('render', 1, 2, time=1050.0), ProgressEvent('complete', 1, 1, time=1060.0)]
+            self.stdout = io.StringIO(''.join(json.dumps(event.__dict__) + '\n' for event in events))
+        def wait(self): return 0
+        def poll(self): return 0
+    with patch('panstudio.worker.subprocess.Popen', Process), patch.object(store, 'transition', recording):
+        runner.run(job_id, run_id)
+    progress = [status for status in seen if status['state'] == 'processing' and status.get('stage')]
+    assert [(s['stage'], s['stage_started_at'], s['stage_fraction']) for s in progress] == \
+        [('detection', 1000.0, 0.25), ('detection', 1000.0, 0.5), ('render', 1050.0, 0.5)]
+    result = store.get(job_id).status
+    assert result['timings'] == {'total_seconds': 90.5, 'stages': {'detection': 60.0, 'render': 30.0}}
+    assert result['finished_at'] >= result['started_at']
+
+
+def test_status_reports_server_time(application):
+    job_id = 'a' * 32
+    application.extensions['job_store'].claim(job_id, {}, 'b' * 32)
+    before = time.time()
+    status = application.test_client().get(f'/api/status/{job_id}').get_json()
+    assert status['state'] == 'queued' and before <= status['server_time'] <= time.time()
 
 
 @pytest.mark.parametrize('version, reused', [(None, False), ('current', True), (-1, False)])
@@ -235,7 +274,7 @@ def test_full_local_workflow_with_generated_video(tmp_path):
         first_run = job.metadata['run_id']
         assert (directory / 'runs' / first_run / 'camera-plan.json').exists()
         # A second processing attempt exercises automatic cache reuse and debug rendering.
-        client.post(f'/api/process/{job_id}', json={'debug': True, 'auto_widen': False})
+        client.post(f'/api/process/{job_id}', json={'debug': True})
         wait_for_job(app, job_id)
         result = client.get(f'/api/status/{job_id}').json
         assert result['state'] == 'complete', result

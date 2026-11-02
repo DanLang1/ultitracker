@@ -95,6 +95,11 @@ def test_cli_reuses_detections_then_renders_saved_plan_without_inference(tmp_pat
     assert not (plan_dir / 'tactical-crop.mp4').exists()
     plan = load_plan(plan_dir / 'camera-plan.json')
     assert plan.samples[0]['crop_width'] == 128
+    timings = json.loads((plan_dir / 'timings.json').read_text())
+    assert list(timings['stages']) == ['mask', 'detection', 'disc', 'planning']
+    assert timings['reused'] == {'detections': True, 'flights': False, 'plan': False}
+    assert timings['footage_seconds'] == 1 and timings['total_seconds'] >= sum(timings['stages'].values()) - 0.05
+    assert {'cpu', 'gpu', 'decoder', 'encoder', 'inference_device'} <= set(timings['machine'])
     monkeypatch.setattr('panstudio.cli.plan_camera', lambda *args: pytest.fail('Planning must not run'))
     main([*common, '--plan-in', str(plan_dir / 'camera-plan.json'), '--output-dir', str(render_dir)])
     capture = cv2.VideoCapture(str(render_dir / 'tactical-crop.mp4'))
@@ -106,6 +111,8 @@ def test_cli_reuses_detections_then_renders_saved_plan_without_inference(tmp_pat
         capture.release()
     events = [ProgressEvent.parse(line) for line in capsys.readouterr().out.splitlines()]
     assert any(event and event.stage == 'complete' for event in events)
+    assert all(event.time > 0 for event in events if event)
+    assert list(json.loads((render_dir / 'timings.json').read_text())['stages']) == ['render']
 
 
 def test_core_import_does_not_load_model_runtime():
@@ -163,8 +170,11 @@ def test_invalid_saved_crop_is_rejected(tmp_path):
 def test_device_selection_prefers_available_gpu_and_respects_overrides(monkeypatch):
     import types
     import panstudio.pipeline as pipeline
-    fake_torch = types.SimpleNamespace(backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: True)))
+    fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True),
+                                       backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: True)))
     monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    assert pipeline.select_device('auto') == 'cuda'
+    fake_torch.cuda.is_available = lambda: False
     assert pipeline.select_device('auto') == 'mps'
     fake_torch.backends.mps.is_available = lambda: False
     assert pipeline.select_device('auto') == 'cpu'

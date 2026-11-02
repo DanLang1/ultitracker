@@ -23,6 +23,35 @@ function formatDuration(seconds) {
   return `${minutes}:${remaining}`;
 }
 
+function formatClock(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const pad = (value) => value.toString().padStart(2, '0');
+  const hours = Math.floor(total / 3600), minutes = Math.floor((total % 3600) / 60);
+  return hours ? `${hours}:${pad(minutes)}:${pad(total % 60)}` : `${minutes}:${pad(total % 60)}`;
+}
+
+const STAGE_NAMES = { mask: 'Mask', detection: 'Player analysis', disc: 'Disc scan', planning: 'Planning', debug: 'Review video', render: 'Render' };
+
+function describeProgressTiming(status) {
+  if (!status.started_at || !status.server_time) return '';
+  let text = `Elapsed ${formatClock(status.server_time - status.started_at)}`;
+  const fraction = status.stage_fraction || 0;
+  const inStage = status.server_time - (status.stage_started_at || status.started_at);
+  // Early in a stage the rate is dominated by startup cost, so wait before estimating.
+  if (status.stage && fraction >= 0.03 && fraction < 1 && inStage >= 15) {
+    text += ` · ${STAGE_NAMES[status.stage] || status.stage}: about ${formatClock(inStage * (1 - fraction) / fraction)} left`;
+  }
+  return text;
+}
+
+function describeTimings(timings) {
+  if (!timings) return '';
+  const stages = Object.entries(timings.stages)
+    .filter(([, seconds]) => seconds >= 1)
+    .map(([stage, seconds]) => `${STAGE_NAMES[stage] || stage} ${formatClock(seconds)}`);
+  return `Processed in ${formatClock(timings.total_seconds)}` + (stages.length ? ` — ${stages.join(' · ')}` : '');
+}
+
 function formatSize(bytes) { return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`; }
 
 function uploadVideo(file) {
@@ -199,10 +228,7 @@ $('#process-button').addEventListener('click', async () => {
     const response = await fetch(`/api/process/${state.jobId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        debug: $('#debug-toggle').checked,
-        auto_widen: $('#auto-widen-toggle').checked,
-      }),
+      body: JSON.stringify({ debug: $('#debug-toggle').checked }),
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not start processing.');
@@ -225,7 +251,9 @@ async function pollStatus(token) {
     $('#process-bar').style.width = `${result.progress || 0}%`;
     $('#process-percent').textContent = `${result.progress || 0}%`;
     $('#process-message').textContent = result.message || 'Processing…';
+    $('#process-timing').textContent = describeProgressTiming(result);
     if (result.state === 'complete') {
+      $('#process-timings').textContent = describeTimings(result.timings);
       $('#process-running').classList.add('hidden');
       $('#process-complete').classList.remove('hidden');
       $('#output-video').src = result.output_url;
@@ -307,7 +335,6 @@ function selectJob(job) {
   $('#video-facts').textContent = `${job.width} × ${job.height} · ${formatDuration(job.duration)} · ${formatSize(job.size)}`;
   $('#process-filename').textContent = job.filename;
   $('#debug-toggle').checked = job.generate_debug || false;
-  $('#auto-widen-toggle').checked = job.auto_widen !== false;
   $('#process-ready').classList.remove('hidden');
   $('#process-running').classList.add('hidden');
   $('#process-complete').classList.add('hidden');

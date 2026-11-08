@@ -10,9 +10,13 @@ import numpy as np
 import pytest
 
 from gui import create_app
+from panstudio import attempt
 from panstudio.events import ProgressEvent
-from panstudio.jobs import JobConflict, JobStore
+from panstudio.jobs import JobConflict, JobStore, ProcessingSettings
+from panstudio.processor import ProcessorRun
 from panstudio.worker import JobRunner
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class IdleRunner:
@@ -25,14 +29,41 @@ class IdleRunner:
         return self.store.get(job_id).status
 
 
-def create_job(store, job_id='a' * 32):
+class ScriptedProcess:
+    """A Popen stand-in that replays processor output."""
+    def __init__(self, events, exit_code=0, noise=''):
+        self.stdout = io.StringIO(noise + ''.join(json.dumps(event.__dict__) + '\n' for event in events))
+        self.exit_code = exit_code
+    def wait(self, timeout=None): return self.exit_code
+    def poll(self): return self.exit_code
+
+
+COMPLETE = ProgressEvent('complete', 1, 1)
+
+
+class ScriptedProcessor:
+    """Test adapter for the processor seam: records each request and replays scripted output."""
+    def __init__(self, events=(COMPLETE,), exit_code=0, files=('tactical-crop.mp4',), timings=None, noise=''):
+        self.events, self.exit_code, self.files, self.timings, self.noise = events, exit_code, files, timings, noise
+        self.commands = []
+    def __call__(self, args, **kwargs):
+        self.commands.append(args)
+        output = Path(args[args.index('--output-dir') + 1])
+        for name in self.files:
+            (output / name).write_bytes(b'output')
+        if self.timings is not None:
+            (output / 'timings.json').write_text(json.dumps(self.timings))
+        return ProcessorRun(ScriptedProcess(self.events, self.exit_code, self.noise))
+
+
+def create_job(store, job_id='a' * 32, **metadata):
     directory = store.root / job_id
     directory.mkdir()
     (directory / 'source.mp4').write_bytes(b'video')
     cv2.imwrite(str(directory / 'active-area-frame.jpg'), np.full((48, 64, 3), 100, dtype=np.uint8))
     cv2.imwrite(str(directory / 'active-area-mask.png'), np.full((48, 64), 255, dtype=np.uint8))
     store.create(job_id, {'job_id': job_id, 'filename': 'source.mp4', 'video_path': str(directory / 'source.mp4'),
-                         'duration': 10., 'width': 64, 'height': 48, 'size': 5})
+                         'duration': 10., 'width': 64, 'height': 48, 'size': 5, **metadata})
     return job_id
 
 
@@ -52,6 +83,15 @@ def test_process_claims_once_and_persists_options(application):
     assert application.extensions['job_runner'].calls == 1
     metadata = application.extensions['job_store'].get(job_id).metadata
     assert metadata['generate_debug'] is False
+    assert metadata['disc_tracking'] is True  # on unless the request turns it off
+
+
+def test_process_persists_disc_tracking_off(application):
+    client = application.test_client()
+    job_id = 'a' * 32
+    client.post(f'/api/process/{job_id}', json={'debug': False, 'disc_tracking': False})
+    assert application.extensions['job_store'].get(job_id).metadata['disc_tracking'] is False
+    assert client.get(f'/api/jobs/{job_id}').json['disc_tracking'] is False
 
 
 def test_restart_recovers_active_jobs_and_preserves_completed_jobs(application):
@@ -59,7 +99,7 @@ def test_restart_recovers_active_jobs_and_preserves_completed_jobs(application):
     active = 'a' * 32
     complete = create_job(store, 'c' * 32)
     for job_id in (active, complete):
-        store.claim(job_id, {}, 'b' * 32)
+        store.claim(job_id, ProcessingSettings(), 'b' * 32)
         store.transition(job_id, 'b' * 32, 'processing')
     store.transition(complete, 'b' * 32, 'complete', progress=100, output_url='/saved.mp4')
     restarted = create_app(store.root, runner_factory=IdleRunner).test_client()
@@ -110,12 +150,12 @@ def test_queue_is_bounded_serial_and_duplicate_safe(tmp_path):
         store.transition(job_id, run_id, 'complete')
     runner.run = run
     try:
-        runner.submit(ids[0], {})
+        runner.submit(ids[0], ProcessingSettings())
         assert started.wait(5)
-        runner.submit(ids[0], {})
-        runner.submit(ids[1], {})
+        runner.submit(ids[0], ProcessingSettings())
+        runner.submit(ids[1], ProcessingSettings())
         with pytest.raises(JobConflict, match='full'):
-            runner.submit(ids[2], {})
+            runner.submit(ids[2], ProcessingSettings())
         assert seen == [ids[0]]
         release.set()
         runner.pending.join()
@@ -126,52 +166,54 @@ def test_queue_is_bounded_serial_and_duplicate_safe(tmp_path):
         runner.close()
 
 
-def test_worker_uses_structured_events_and_requires_output(application):
-    store = application.extensions['job_store']
-    job_id, run_id = 'a' * 32, 'b' * 32
-    store.claim(job_id, {'auto_widen': False}, run_id)  # saved before widening became mandatory
-    runner = JobRunner(store, Path(__file__).resolve().parents[1])
-    class Process:
-        def __init__(self, command, **kwargs):
-            assert '--no-auto-widen' not in command
-            output = Path(command[command.index('--output-dir') + 1])
-            (output / 'tactical-crop.mp4').write_bytes(b'output')
-            self.stdout = io.StringIO('Human wording can change completely\n' + json.dumps(ProgressEvent('render', 1, 2).__dict__) + '\n' + json.dumps(ProgressEvent('complete', 1, 1).__dict__) + '\n')
-        def wait(self):
-            return 0
-        def poll(self):
-            return 0
-    with patch('panstudio.worker.subprocess.Popen', Process):
-        runner.run(job_id, run_id)
+def test_worker_uses_structured_events_and_requires_output(tmp_path):
+    store = JobStore(tmp_path)
+    job_id, run_id = create_job(store, auto_widen=False), 'b' * 32  # saved before widening became mandatory
+    store.claim(job_id, ProcessingSettings(), run_id)
+    processor = ScriptedProcessor([ProgressEvent('render', 1, 2), ProgressEvent('complete', 1, 1)],
+                                  noise='Human wording can change completely\n')
+    JobRunner(store, ROOT, start_processor=processor).run(job_id, run_id)
+    assert '--no-auto-widen' not in processor.commands[0]
     result = store.get(job_id).status
     assert result['state'] == 'complete'
     assert result['progress'] == 100
     assert f'/runs/{run_id}/' in result['output_url']
 
 
+def test_worker_fails_when_output_is_missing(application):
+    store = application.extensions['job_store']
+    job_id, run_id = 'a' * 32, 'b' * 32
+    store.claim(job_id, ProcessingSettings(generate_debug=True), run_id)
+    JobRunner(store, ROOT, start_processor=ScriptedProcessor()).run(job_id, run_id)
+    assert store.get(job_id).status['error'] == 'Processor completed without the requested review video.'
+
+
+def test_worker_skips_disc_scan_when_tracking_is_off(application):
+    store = application.extensions['job_store']
+    job_id, run_id = 'a' * 32, 'b' * 32
+    store.claim(job_id, ProcessingSettings(disc_tracking=False), run_id)
+    processor = ScriptedProcessor()
+    JobRunner(store, ROOT, start_processor=processor).run(job_id, run_id)
+    assert '--no-disc-tracking' in processor.commands[0] and '--flights-in' not in processor.commands[0]
+    assert store.get(job_id).status['state'] == 'complete'
+
+
 def test_worker_tracks_stage_timing_and_attaches_final_timings(application):
     store = application.extensions['job_store']
     job_id, run_id = 'a' * 32, 'b' * 32
-    store.claim(job_id, {}, run_id)
-    runner = JobRunner(store, Path(__file__).resolve().parents[1])
+    store.claim(job_id, ProcessingSettings(), run_id)
     seen = []
     original = store.transition
     def recording(*args, **kwargs):
         result = original(*args, **kwargs)
         seen.append(dict(store.get(job_id).status))
         return result
-    class Process:
-        def __init__(self, command, **kwargs):
-            output = Path(command[command.index('--output-dir') + 1])
-            (output / 'tactical-crop.mp4').write_bytes(b'output')
-            (output / 'timings.json').write_text(json.dumps({'total_seconds': 90.5, 'stages': {'detection': 60.0, 'render': 30.0}, 'machine': {}}))
-            events = [ProgressEvent('detection', 1, 4, time=1000.0), ProgressEvent('detection', 2, 4, time=1010.0),
-                      ProgressEvent('render', 1, 2, time=1050.0), ProgressEvent('complete', 1, 1, time=1060.0)]
-            self.stdout = io.StringIO(''.join(json.dumps(event.__dict__) + '\n' for event in events))
-        def wait(self): return 0
-        def poll(self): return 0
-    with patch('panstudio.worker.subprocess.Popen', Process), patch.object(store, 'transition', recording):
-        runner.run(job_id, run_id)
+    processor = ScriptedProcessor(
+        [ProgressEvent('detection', 1, 4, time=1000.0), ProgressEvent('detection', 2, 4, time=1010.0),
+         ProgressEvent('render', 1, 2, time=1050.0), ProgressEvent('complete', 1, 1, time=1060.0)],
+        timings={'total_seconds': 90.5, 'stages': {'detection': 60.0, 'render': 30.0}, 'machine': {}})
+    with patch.object(store, 'transition', recording):
+        JobRunner(store, ROOT, start_processor=processor).run(job_id, run_id)
     progress = [status for status in seen if status['state'] == 'processing' and status.get('stage')]
     assert [(s['stage'], s['stage_started_at'], s['stage_fraction']) for s in progress] == \
         [('detection', 1000.0, 0.25), ('detection', 1000.0, 0.5), ('render', 1050.0, 0.5)]
@@ -182,19 +224,17 @@ def test_worker_tracks_stage_timing_and_attaches_final_timings(application):
 
 def test_status_reports_server_time(application):
     job_id = 'a' * 32
-    application.extensions['job_store'].claim(job_id, {}, 'b' * 32)
+    application.extensions['job_store'].claim(job_id, ProcessingSettings(), 'b' * 32)
     before = time.time()
     status = application.test_client().get(f'/api/status/{job_id}').get_json()
     assert status['state'] == 'queued' and before <= status['server_time'] <= time.time()
 
 
 @pytest.mark.parametrize('version, reused', [(None, False), ('current', True), (-1, False)])
-def test_worker_reuses_flights_only_from_current_detector(application, version, reused):
+def test_attempt_reuses_flights_only_from_current_detector(tmp_path, version, reused):
     from panstudio.artifacts import save_flights
     from panstudio.disc import DETECTOR_VERSION
-    store = application.extensions['job_store']
-    job_id, run_id = 'a' * 32, 'b' * 32
-    previous = store.directory(job_id) / 'runs' / ('c' * 32)
+    previous = tmp_path / 'runs' / ('c' * 32)
     previous.mkdir(parents=True)
     (previous / 'detections.json').write_text('{}')  # load_detections and validate_reuse are stubbed below
     flights = previous / 'flights.json'
@@ -202,45 +242,72 @@ def test_worker_reuses_flights_only_from_current_detector(application, version, 
         flights.write_text(json.dumps({'schema': 'flights/v1', 'start': 0, 'end': 10, 'flights': []}))
     else:
         save_flights(flights, [], 0, 10, DETECTOR_VERSION if version == 'current' else version)
-    store.claim(job_id, {}, run_id)
-    runner = JobRunner(store, Path(__file__).resolve().parents[1])
-    commands = []
-    class Process:
-        def __init__(self, command, **kwargs):
-            commands.append(command)
-            output = Path(command[command.index('--output-dir') + 1])
-            (output / 'tactical-crop.mp4').write_bytes(b'output')
-            self.stdout = io.StringIO(json.dumps(ProgressEvent('complete', 1, 1).__dict__) + '\n')
-        def wait(self): return 0
-        def poll(self): return 0
-    with patch('panstudio.worker.subprocess.Popen', Process), \
-         patch('panstudio.worker.probe_video'), patch('panstudio.worker.load_detections'), \
-         patch('panstudio.worker.validate_reuse'):
-        runner.run(job_id, run_id)
-    command = commands[0]
-    assert '--detections-in' in command
-    assert ('--flights-in' in command) == reused
-    if reused:
-        assert command[command.index('--flights-in') + 1] == str(flights)
+    with patch('panstudio.attempt.probe_video'), patch('panstudio.attempt.load_detections'), \
+         patch('panstudio.attempt.validate_reuse'):
+        request = attempt.prepare(tmp_path, 'b' * 32, tmp_path / 'source.mp4', 10.0, tmp_path / 'mask.png', model='m.pt')
+    assert request.detections_in == previous / 'detections.json'
+    assert (request.flights_in == flights) == reused
+    assert ('--flights-in' in request.args()) == reused
+
+
+def test_attempt_skips_invalid_caches_and_validates_with_processor_defaults(tmp_path):
+    runs = tmp_path / 'runs'
+    for name in ('old', 'new'):
+        (runs / name).mkdir(parents=True)
+        (runs / name / 'detections.json').write_text('{}')
+    seen = []
+    def validate(config, artifact, video):
+        seen.append(config)
+        if artifact == 'new':
+            raise ValueError('different detector settings')
+    with patch('panstudio.attempt.probe_video'), patch('panstudio.attempt.validate_reuse', validate), \
+         patch('panstudio.attempt.load_detections', lambda path: path.parent.name):
+        import os
+        os.utime(runs / 'old' / 'detections.json', ns=(1, 1))
+        request = attempt.prepare(tmp_path, 'b' * 32, tmp_path / 'source.mp4', 10.0, tmp_path / 'mask.png',
+                                  model='m.pt', disc_tracking=False)
+    assert request.detections_in == runs / 'old' / 'detections.json' and request.flights_in is None
+    # The cache is checked against the configuration the processor itself will parse.
+    from panstudio.cli import parse_args
+    from panstudio.models import ProcessingConfig
+    assert seen[0] == ProcessingConfig.from_namespace(parse_args(request.args()))
+    assert seen[0].end == 9.95 and seen[0].no_disc_tracking
+
+
+def test_processor_requires_completion_event_and_clean_exit():
+    from panstudio.processor import ProcessorFailed
+    run = ProcessorRun(ScriptedProcess([ProgressEvent('render', 1, 2)]))
+    assert [event.stage for event in run.events()] == ['render']
+    with pytest.raises(ProcessorFailed, match='did not complete'):
+        run.finish()
+    run = ProcessorRun(ScriptedProcess([ProgressEvent('complete', 1, 1)], exit_code=1))
+    list(run.events())
+    with pytest.raises(ProcessorFailed, match='exit status 1'):
+        run.finish()
+
+
+def test_processing_settings_default_and_validate():
+    assert ProcessingSettings.from_request({}) == ProcessingSettings(False, True)
+    assert ProcessingSettings.from_metadata({}) == ProcessingSettings(False, True)  # saved before the options existed
+    assert ProcessingSettings.from_metadata({'disc_tracking': False}).disc_tracking is False
+    for bad in ({'debug': 'false'}, {'disc_tracking': 0}, []):
+        with pytest.raises(ValueError):
+            ProcessingSettings.from_request(bad)
 
 
 def test_worker_reports_structured_error(application):
     store = application.extensions['job_store']
     job_id, run_id = 'a' * 32, 'b' * 32
-    store.claim(job_id, {}, run_id)
-    runner = JobRunner(store, Path(__file__).resolve().parents[1])
-    class Process:
-        stdout = io.StringIO(json.dumps(ProgressEvent('error', message='Bad calibration').__dict__) + '\nTraceback noise\n')
-        def wait(self): return 1
-        def poll(self): return 1
-    with patch('panstudio.worker.subprocess.Popen', return_value=Process()):
-        runner.run(job_id, run_id)
+    store.claim(job_id, ProcessingSettings(), run_id)
+    processor = ScriptedProcessor([ProgressEvent('error', message='Bad calibration')], exit_code=1, files=())
+    JobRunner(store, ROOT, start_processor=processor).run(job_id, run_id)
     assert store.get(job_id).status['error'] == 'Bad calibration'
 
 
 def test_invalid_boolean_does_not_start_job(application):
     client = application.test_client()
     assert client.post('/api/process/' + 'a' * 32, json={'debug': 'false'}).status_code == 400
+    assert client.post('/api/process/' + 'a' * 32, json={'disc_tracking': 0}).status_code == 400
     assert application.extensions['job_runner'].calls == 0
 
 

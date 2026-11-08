@@ -3,6 +3,9 @@ from dataclasses import asdict, dataclass
 import json
 import time
 
+# Stages the processor reports progress for, in the order they run.
+STAGES = ('detection', 'disc', 'planning', 'debug', 'render')
+
 
 @dataclass(frozen=True)
 class ProgressEvent:
@@ -20,7 +23,7 @@ class ProgressEvent:
             if not isinstance(data, dict) or data.get('protocol') != 'tactical-pan/v1':
                 return None
             event = cls(**data)
-            if event.stage not in {'detection', 'disc', 'planning', 'debug', 'render', 'complete', 'error'}:
+            if event.stage not in (*STAGES, 'complete', 'error'):
                 return None
             if type(event.completed) is not int or type(event.total) is not int or not isinstance(event.message, str) \
                     or type(event.time) not in (int, float):

@@ -1,39 +1,33 @@
 """A bounded single-worker queue, retaining subprocess isolation for inference."""
-import json
-import os
 from pathlib import Path
 import queue
-import signal
-import subprocess
-import sys
 import threading
 import time
 import uuid
 
-from .artifacts import flights_version, load_detections
-from .disc import DETECTOR_VERSION
-from .models import DEFAULT_MODEL, ProcessingConfig
-from .pipeline import probe_video, validate_reuse
-from .events import ProgressEvent
-from .jobs import BUSY, JobConflict, JobStore
+from . import attempt, processor
+from .jobs import MASK_FILE, JobConflict, JobStore, ProcessingSettings
+from .models import DEFAULT_MODEL
 
 
 class JobRunner:
-    def __init__(self, store: JobStore, root: Path, capacity: int = 8, calibration: Path | None = None):
+    def __init__(self, store: JobStore, root: Path, capacity: int = 8, calibration: Path | None = None,
+                 start_processor=processor.start):
         self.store = store
+        self.start_processor = start_processor
         self.root = Path(root).resolve()
         self.calibration = Path(calibration).resolve() if calibration else None
         self.pending = queue.Queue()
         self.slots = threading.BoundedSemaphore(capacity)
         self.lock = threading.RLock()
         self.thread = None
-        self.process = None
+        self.running = None
         self.closed = False
 
-    def submit(self, job_id: str, settings: dict):
+    def submit(self, job_id: str, settings: ProcessingSettings):
         with self.lock, self.store.lock:
             job = self.store.get(job_id)
-            if job.status['state'] in BUSY:
+            if job.busy:
                 return job.status
             if self.closed:
                 raise JobConflict('The processor is shutting down.')
@@ -70,135 +64,67 @@ class JobRunner:
                 self.pending.task_done()
 
     def run(self, job_id: str, run_id: str):
-        process = None
+        running = None
         try:
             job = self.store.get(job_id)
             directory = self.store.directory(job_id)
-            output = directory / 'runs' / run_id
-            output.mkdir(parents=True, exist_ok=True)
-            metadata = job.metadata
-            # The whole video, stopping just short of the reported duration, which
-            # containers often overstate by a frame.
-            end = max(0.1, metadata['duration'] - 0.05)
-            model = str(self.root / DEFAULT_MODEL)
-            command = [sys.executable, str(self.root / 'tactical_pan.py'), metadata['video_path'],
-                       '--start', '0', '--end', str(end), '--output-dir', str(output), '--model', model, '--supervised',
-                       '--play-area', str(directory / 'active-area-mask.png')]
-            # A failed retry may not have produced detections. Look back through all
-            # attempts and reuse the newest valid cache, rather than losing earlier work.
-            caches = sorted((directory / 'runs').glob('*/detections.json'), key=lambda path: path.stat().st_mtime_ns, reverse=True)
-            if caches:
-                config = ProcessingConfig(Path(metadata['video_path']), 0, end, model=model)
-                video = probe_video(config.input)
-                for cached in caches:
-                    try:
-                        validate_reuse(config, load_detections(cached), video)
-                    except (ValueError, TypeError, KeyError, OSError):
-                        continue
-                    command.extend(['--detections-in', str(cached)])
-                    # Flights from an older disc detector are rescanned so detector fixes take effect.
-                    if flights_version(cached.parent / 'flights.json') == DETECTOR_VERSION:
-                        command.extend(['--flights-in', str(cached.parent / 'flights.json')])
-                    break
-            if metadata.get('generate_debug'):
-                command.append('--debug')
-            if self.calibration:
-                command.extend(['--calibration', str(self.calibration)])
-            environment = os.environ.copy()
-            environment.update(PYTHONUNBUFFERED='1', YOLO_CONFIG_DIR=str(directory / '.ultralytics'),
-                               MPLCONFIGDIR=str(directory / '.matplotlib'))
+            settings = job.settings
+            request = attempt.prepare(directory, run_id, job.source, job.metadata['duration'], directory / MASK_FILE,
+                                      model=str(self.root / DEFAULT_MODEL), debug=settings.generate_debug,
+                                      disc_tracking=settings.disc_tracking, calibration=self.calibration)
             started = time.time()
             if not self.store.transition(job_id, run_id, 'processing', progress=1, message='Starting player analysis…',
                                          started_at=started, stage=None, stage_started_at=started, stage_fraction=0.0):
                 return
-            with (output / 'process.log').open('w') as log:
+            with (request.output_dir / 'process.log').open('w') as log:
+                def write(line):
+                    log.write(line)
+                    log.flush()
                 with self.lock:
                     if self.closed:
                         self.store.transition(job_id, run_id, 'interrupted', message='Processing was interrupted.')
                         return
-                    process = subprocess.Popen(command, cwd=self.root, env=environment, stdout=subprocess.PIPE,
-                                               stderr=subprocess.STDOUT, stdin=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
-                    self.process = process
-                detail = ''
-                completed = False
-                assert process.stdout is not None
-                for line in process.stdout:
-                    log.write(line)
-                    log.flush()
-                    event = ProgressEvent.parse(line)
-                    if event:
-                        if event.stage == 'error':
-                            detail = event.message
-                        elif event.stage == 'complete':
-                            completed = True
-                        else:
-                            self._progress(job_id, run_id, event, bool(metadata.get('generate_debug')))
-                return_code = process.wait()
-                if return_code or not completed:
-                    raise RuntimeError(detail or f'Processor did not complete (exit status {return_code}). See the job log.')
-            if not (output / 'tactical-crop.mp4').is_file():
-                raise RuntimeError('Processor completed without an output video.')
-            result = {'progress': 100, 'message': 'Your tactical video is ready.', 'finished_at': time.time(),
-                      'output_url': f'/jobs/{job_id}/runs/{run_id}/tactical-crop.mp4'}
-            try:
-                timings = json.loads((output / 'timings.json').read_text())
-                result['timings'] = {'total_seconds': timings['total_seconds'], 'stages': timings['stages']}
-            except (OSError, ValueError, KeyError):
-                pass
-            if metadata.get('generate_debug'):
-                if not (output / 'debug-wide.mp4').is_file():
-                    raise RuntimeError('Processor completed without the requested review video.')
-                result['debug_url'] = f'/jobs/{job_id}/runs/{run_id}/debug-wide.mp4'
-            self.store.transition(job_id, run_id, 'complete', **result)
+                    running = self.start_processor(request.args(), cwd=self.root, env={
+                        'YOLO_CONFIG_DIR': str(directory / '.ultralytics'), 'MPLCONFIGDIR': str(directory / '.matplotlib')})
+                    self.running = running
+                for event in running.events(on_line=write):
+                    self._progress(job_id, run_id, event, request.debug)
+                running.finish()
+            result = attempt.collect(request)
+            status = {'progress': 100, 'message': 'Your tactical video is ready.', 'finished_at': time.time(),
+                      'output_url': self._url(job_id, run_id, result.output)}
+            if result.timings:
+                status['timings'] = result.timings
+            if result.debug:
+                status['debug_url'] = self._url(job_id, run_id, result.debug)
+            self.store.transition(job_id, run_id, 'complete', **status)
         except Exception as error:
             self.store.transition(job_id, run_id, 'interrupted' if self.closed else 'failed', message=str(error), error=str(error))
         finally:
-            if process is not None:
-                if process.poll() is None:
-                    self._terminate(process)
-                if process.stdout is not None:
-                    process.stdout.close()
-                if getattr(process, 'stdin', None) is not None:
-                    process.stdin.close()
+            if running is not None:
+                running.close()
             with self.lock:
-                self.process = None
+                self.running = None
+
+    @staticmethod
+    def _url(job_id, run_id, path: Path):
+        return f'/jobs/{job_id}/runs/{run_id}/{path.name}'
 
     def _progress(self, job_id, run_id, event, debug):
-        fraction = event.completed / max(1, event.total)
-        if event.stage == 'detection':
-            progress, message = 5 + round(40 * fraction), 'Analyzing players…'
-        elif event.stage == 'disc':
-            progress, message = 45 + round(24 * fraction), 'Scanning for disc flights…'
-        elif event.stage == 'planning':
-            progress, message = 70, 'Planning the camera path…'
-        elif event.stage == 'debug':
-            progress, message = 70 + round(15 * fraction), 'Rendering the review video…'
-        elif event.stage == 'render':
-            progress = (85 if debug else 70) + round((14 if debug else 29) * fraction)
-            message = 'Rendering the tactical crop…'
-        else:
+        overall = processor.overall_progress(event, debug)
+        if overall is None:
             return
-        timing = {'stage': event.stage, 'stage_fraction': round(fraction, 4)}
+        progress, message = overall
+        timing = {'stage': event.stage, 'stage_fraction': round(event.completed / max(1, event.total), 4)}
         if event.stage != self.store.get(job_id).status.get('stage'):
             timing['stage_started_at'] = event.time or time.time()
         self.store.transition(job_id, run_id, 'processing', progress=progress, message=event.message or message, **timing)
 
-    @staticmethod
-    def _terminate(process):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except ProcessLookupError:
-            pass
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-
     def close(self):
         with self.lock:
             self.closed = True
-            if self.process is not None and self.process.poll() is None:
-                self._terminate(self.process)
+            if self.running is not None:
+                self.running.terminate()
             if self.thread is not None:
                 self.pending.put(None)
         if self.thread is not None:

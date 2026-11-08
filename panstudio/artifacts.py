@@ -8,6 +8,12 @@ import tempfile
 
 from .models import CameraPlan, Detection, DetectionSample, DetectionSet, SourceIdentity, VideoInfo
 
+# File names inside a run's output directory.
+DETECTIONS_FILE = 'detections.json'
+FLIGHTS_FILE = 'flights.json'
+TIMINGS_FILE = 'timings.json'
+DEBUG_VIDEO_FILE = 'debug-wide.mp4'
+
 
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +114,12 @@ def flights_version(path: Path) -> int | None:
         return None
     version = data.get('detector_version') if isinstance(data, dict) else None
     return version if isinstance(version, int) and not isinstance(version, bool) else None
+
+
+def flights_reusable(path: Path) -> bool:
+    """Flights saved by an older disc detector are scanned again, so detector fixes take effect."""
+    from .disc import DETECTOR_VERSION
+    return flights_version(path) == DETECTOR_VERSION
 
 
 def load_flights(path: Path) -> list[dict]:

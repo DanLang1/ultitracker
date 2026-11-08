@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Tactical Pan Studio</title>
+    <title>Auto Pan Frisbee Tracker</title>
     <link rel="stylesheet" href="/static/app.css" />
   </head>
   <body>
@@ -77,6 +77,10 @@
           <div>
             <strong id="process-filename">Ready to process</strong>
             <span>2560 × 1440 · keeps the source audio · a full game takes several minutes</span>
+            <label class="debug-option">
+              <input id="disc-toggle" type="checkbox" checked />
+              <span><b>Follow long throws</b><small>Scans for disc flights so hucks land in frame. Adds about a quarter to the processing time.</small></span>
+            </label>
             <label class="debug-option">
               <input id="debug-toggle" type="checkbox" />
               <span><b>Generate debug review video</b><small>Adds a full-width detection overlay and takes longer.</small></span>

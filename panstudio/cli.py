@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 import cv2
 
-from .artifacts import atomic_json, flights_version, load_detections, load_flights, load_plan, save_detections, save_flights, save_plan
+from .artifacts import DETECTIONS_FILE, FLIGHTS_FILE, TIMINGS_FILE, atomic_json, flights_reusable, load_detections, load_flights, load_plan, save_detections, save_flights, save_plan
 from .events import report
 from .masking import load_play_area_mask, save_mask_preview
 from .models import DEFAULT_MODEL, DEVICES, ProcessingConfig
@@ -84,7 +84,7 @@ def export_flights(config, video, detections, mask, directory):
     except Exception as error:  # noqa: BLE001 - advisory output
         report('disc', 1, 1, f'Disc flight scan failed: {error}')
         return []
-    save_flights(directory / 'flights.json', flights, config.start, config.end, DETECTOR_VERSION)
+    save_flights(directory / FLIGHTS_FILE, flights, config.start, config.end, DETECTOR_VERSION)
     report('disc', 1, 1, f'Found {len(flights)} disc flights')
     return [flight.to_json() for flight in flights]
 
@@ -93,10 +93,9 @@ def flights_for(config, options, video, detections, mask):
     if config.no_disc_tracking:
         return []
     from .disc import DETECTOR_VERSION
-    # Flights saved by an older disc detector are scanned again rather than reused.
-    if options.flights_in and flights_version(options.flights_in) == DETECTOR_VERSION:
+    if options.flights_in and flights_reusable(options.flights_in):
         flights = load_flights(options.flights_in)
-        save_flights(config.output_dir / 'flights.json', flights, config.start, config.end, DETECTOR_VERSION)
+        save_flights(config.output_dir / FLIGHTS_FILE, flights, config.start, config.end, DETECTOR_VERSION)
         report('disc', 1, 1, f'Reusing {len(flights)} saved disc flights')
         return flights
     return export_flights(config, video, detections, mask, config.output_dir)
@@ -141,7 +140,7 @@ def run(config, options, video, timer=None) -> str:
     if options.detect_only:
         validate_video(config, video, check_crop=False)
         with timer.stage('detection'):
-            save_detections(config.output_dir / 'detections.json', detect(config, video))
+            save_detections(config.output_dir / DETECTIONS_FILE, detect(config, video))
         return 'Saved raw detections'
     validate_video(config, video)
     with timer.stage('mask'):
@@ -157,7 +156,7 @@ def run(config, options, video, timer=None) -> str:
             report('detection', len(detections.samples), len(detections.samples), 'Reusing saved detections')
         else:
             detections = detect(config, video)
-        save_detections(config.output_dir / 'detections.json', detections)
+        save_detections(config.output_dir / DETECTIONS_FILE, detections)
     with timer.stage('disc'):
         flights = flights_for(config, options, video, detections, mask)
     with timer.stage('planning'):
@@ -171,7 +170,7 @@ def run(config, options, video, timer=None) -> str:
 
 def save_timings(config, options, video, timer):
     """Record how long each stage took, on what hardware, and what was reused rather than recomputed."""
-    atomic_json(config.output_dir / 'timings.json', {
+    atomic_json(config.output_dir / TIMINGS_FILE, {
         **timer.summary(),
         'footage_seconds': round(config.end - config.start, 3),
         'video': {'width': video.width, 'height': video.height, 'fps': video.fps},

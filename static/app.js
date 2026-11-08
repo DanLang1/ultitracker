@@ -228,7 +228,7 @@ $('#process-button').addEventListener('click', async () => {
     const response = await fetch(`/api/process/${state.jobId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ debug: $('#debug-toggle').checked }),
+      body: JSON.stringify({ debug: $('#debug-toggle').checked, disc_tracking: $('#disc-toggle').checked }),
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Could not start processing.');
@@ -335,6 +335,7 @@ function selectJob(job) {
   $('#video-facts').textContent = `${job.width} × ${job.height} · ${formatDuration(job.duration)} · ${formatSize(job.size)}`;
   $('#process-filename').textContent = job.filename;
   $('#debug-toggle').checked = job.generate_debug || false;
+  $('#disc-toggle').checked = job.disc_tracking !== false;
   $('#process-ready').classList.remove('hidden');
   $('#process-running').classList.add('hidden');
   $('#process-complete').classList.add('hidden');

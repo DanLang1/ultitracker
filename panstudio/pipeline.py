@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .artifacts import source_identity
+from .artifacts import DEBUG_VIDEO_FILE, source_identity
 from .events import report
 from .media import prefetched, render, sampled_analysis_frames
 from .models import CameraPlan, Detection, DetectionSample, DetectionSet, DetectorSettings, ProcessingConfig, Sample, VideoInfo
@@ -94,11 +94,13 @@ def validate_reuse(config: ProcessingConfig, artifact: DetectionSet | CameraPlan
             raise ValueError('Saved detections have different detector settings; rerun detection')
 
 
-def plan_camera(config: ProcessingConfig, detections: DetectionSet, mask=None, flights=()) -> CameraPlan:
-    """Build fresh working records on every call so repeated planning is deterministic."""
+def track_players(config: ProcessingConfig, detections: DetectionSet, mask, calibration) -> list[Sample]:
+    """Tracker: per-sample field players with track ids, velocities, raw centres and the deep-pair signal.
+
+    Order matters: suppress_stationary_tracks assigns the track ids and velocities the later
+    stages read, and identify_deep_pairs reads the raw centres.
+    """
     video = detections.video
-    calibration = config.calibration.scaled(video.width, video.height)
-    args = replace(config, calibration=calibration)
     records: list[Sample] = []
     for sample in detections.samples:
         players = select_field_players(
@@ -108,23 +110,41 @@ def plan_camera(config: ProcessingConfig, detections: DetectionSet, mask=None, f
         records.append({'time': sample.time, 'source_time': sample.source_time, 'players': players})
     if not records:
         raise ValueError('Cannot plan an empty detection set')
-    suppress_stationary_tracks(records, args.sample_rate, calibration)
-    suppress_bystanders(records, args.sample_rate, video.width, video.height)
+    suppress_stationary_tracks(records, config.sample_rate, calibration)
+    suppress_bystanders(records, config.sample_rate, video.width, video.height)
     calculate_raw_centers(records, video.width)
-    identify_deep_pairs(records, args.sample_rate, calibration)
+    identify_deep_pairs(records, config.sample_rate, calibration)
+    return records
+
+
+def plan_path(config: ProcessingConfig, records: list[Sample], video: VideoInfo, flights=()):
+    """Camera-path planner: turns tracked records into a crop path, written onto each record.
+
+    config must carry calibration already scaled to the video. Flights are annotated before
+    crop widths are planned, because plan_crop_widths reads the flight extents.
+    """
+    calibration = config.calibration
     raw = np.array([record['raw_center_x'] for record in records])
-    centers = smooth_centers(raw, args.crop_width, video.width, args.sample_rate, calibration)
-    centers = apply_deep_coverage(args, records, centers, video.width)
+    centers = smooth_centers(raw, config.crop_width, video.width, config.sample_rate, calibration)
+    centers = apply_deep_coverage(config, records, centers, video.width)
     if flights and not config.no_disc_tracking:
-        ignored = annotate_flights(records, flights, args.crop_width, video.width, args.look_room)
+        ignored = annotate_flights(records, flights, config.crop_width, video.width, config.look_room)
         if ignored:
             report('planning', 0, 1, f'Ignored {len(ignored)} long flights that moved with a runner: '
                    + ', '.join(f"{int(f['start'] // 60)}:{f['start'] % 60:04.1f}" for f in ignored))
-        centers = apply_flight_targets(args, records, centers, video.width)
+        centers = apply_flight_targets(config, records, centers, video.width)
     times = np.array([record['time'] for record in records])
-    centers = apply_manual_corrections(args, times, centers)
-    centers = np.clip(centers, args.crop_width / 2, video.width - args.crop_width / 2)
-    apply_crop_geometry(args, records, centers, video.width, video.height)
+    centers = apply_manual_corrections(config, times, centers)
+    centers = np.clip(centers, config.crop_width / 2, video.width - config.crop_width / 2)
+    apply_crop_geometry(config, records, centers, video.width, video.height)
+
+
+def plan_camera(config: ProcessingConfig, detections: DetectionSet, mask=None, flights=()) -> CameraPlan:
+    """Build fresh working records on every call so repeated planning is deterministic."""
+    video = detections.video
+    args = replace(config, calibration=config.calibration.scaled(video.width, video.height))
+    records = track_players(args, detections, mask, args.calibration)
+    plan_path(args, records, video, flights)
     report('planning', 1, 1)
     settings = {key: str(value) if isinstance(value, Path) else value for key, value in asdict(config).items()}
     return CameraPlan(video, detections.source, args.start, args.end, args.crop_width, args.crop_height, tuple(records), settings)
@@ -134,5 +154,5 @@ def render_plan(config: ProcessingConfig, plan: CameraPlan):
     video = plan.video
     args = replace(config, crop_width=plan.crop_width, crop_height=plan.crop_height)
     if args.debug:
-        render(args, list(plan.samples), video.width, video.height, video.fps, args.output_dir / 'debug-wide.mp4', True)
+        render(args, list(plan.samples), video.width, video.height, video.fps, args.output_dir / DEBUG_VIDEO_FILE, True)
     render(args, list(plan.samples), video.width, video.height, video.fps, args.output_dir / f'{args.output_name}.mp4', False)

@@ -1,9 +1,9 @@
 [project]
-name = "tactical-pan-studio"
+name = "auto-pan-frisbee-tracker"
 version = "0.1.0"
 description = "Local tactical auto-pan processing for fixed wide-angle ultimate footage"
 readme = "README.md"
-license = "MIT"
+license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [

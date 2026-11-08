@@ -19,7 +19,7 @@ import cv2
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from werkzeug.utils import secure_filename
 
-from panstudio.jobs import BUSY, JobConflict, JobStore
+from panstudio.jobs import FRAME_FILE, MASK_FILE, PREVIEW_FILE, SOURCE_FILE, JobConflict, JobStore, ProcessingSettings
 from panstudio.masking import polygon_mask, save_mask_preview
 from panstudio.media import extract_frame
 from panstudio.pipeline import probe_video
@@ -50,23 +50,23 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
         return wrapped
 
     def public_job(job):
-        directory = store.directory(job.id)
         metadata = job.metadata
         return {
             'job_id': job.id, 'filename': metadata['filename'],
             'width': metadata['width'], 'height': metadata['height'],
             'duration': metadata['duration'], 'size': metadata['size'],
-            'generate_debug': metadata.get('generate_debug', False),
-            'has_mask': (directory / 'active-area-mask.png').is_file(),
-            'frame_url': f'/jobs/{job.id}/active-area-frame.jpg',
-            'preview_url': f'/jobs/{job.id}/play-area-preview.jpg',
+            'generate_debug': job.settings.generate_debug,
+            'disc_tracking': job.settings.disc_tracking,
+            'has_mask': store.has_mask(job.id),
+            'frame_url': f'/jobs/{job.id}/{FRAME_FILE}',
+            'preview_url': f'/jobs/{job.id}/{PREVIEW_FILE}',
             'status': job.status, 'points': metadata.get('points'),
-            'source_missing': not Path(metadata['video_path']).is_file(),
+            'source_missing': not job.source.is_file(),
         }
 
     def require_source(job_id):
         """Analysis and processing read the source video; a job whose file was deleted cannot run."""
-        if not Path(store.get(job_id).metadata['video_path']).is_file():
+        if not store.get(job_id).source.is_file():
             raise ValueError("This job's source video has been deleted. Upload the video again to process it.")
 
     @app.get('/')
@@ -95,12 +95,12 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
         directory = store.root / job_id
         directory.mkdir()
         filename = secure_filename(uploaded.filename) or 'source-video.mp4'
-        video_path = directory / 'source.mp4'
+        video_path = directory / SOURCE_FILE
         try:
             uploaded.save(video_path)
             video = probe_video(video_path)
             preview_time = min(40.0, max(0.0, video.duration * 0.2))
-            extract_frame(video_path, preview_time, directory / 'active-area-frame.jpg', width=1600)
+            extract_frame(video_path, preview_time, directory / FRAME_FILE, width=1600)
             metadata = {'width': video.width, 'height': video.height, 'duration': video.duration,
                         'size': video_path.stat().st_size, 'job_id': job_id, 'filename': filename,
                         'video_path': str(video_path.resolve())}
@@ -113,42 +113,31 @@ def create_app(jobs_root: Path = JOBS_ROOT, *, runner_factory=JobRunner, calibra
     @app.post('/api/active-area/<job_id>')
     @api_errors
     def create_active_area(job_id):
-        with store.lock:
-            job = store.get(job_id)
-            if job.status['state'] in BUSY:
-                raise JobConflict('Wait for processing to finish before changing the active area.')
-            directory = store.directory(job_id)
-            payload = request.get_json(force=True)
-            if not isinstance(payload, dict):
-                raise ValueError('Expected an object containing outline points.')
-            points = payload.get('points', [])
-            if len(points) < 3:
-                raise ValueError('Draw one closed outline around the active field.')
-            clean = cv2.imread(str(directory / 'active-area-frame.jpg'))
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError('Expected an object containing outline points.')
+        points = payload.get('points', [])
+
+        def write_files(directory):
+            clean = cv2.imread(str(directory / FRAME_FILE))
             if clean is None:
                 raise ValueError('The preview frame is missing')
             height, width = clean.shape[:2]
             mask = polygon_mask(points, width, height)
-            cv2.imwrite(str(directory / 'active-area-mask.png'), mask)
-            save_mask_preview(mask, clean, directory / 'play-area-preview.jpg')
-            store.save(job_id, metadata={**job.metadata, 'points': points},
-                       status={'state': 'ready', 'progress': 0, 'message': 'Review the active area, then process.'})
-            return jsonify(preview_url=f'/jobs/{job_id}/play-area-preview.jpg?v={uuid.uuid4().hex[:8]}')
+            cv2.imwrite(str(directory / MASK_FILE), mask)
+            save_mask_preview(mask, clean, directory / PREVIEW_FILE)
+
+        store.set_active_area(job_id, points, write_files)
+        return jsonify(preview_url=f'/jobs/{job_id}/{PREVIEW_FILE}?v={uuid.uuid4().hex[:8]}')
 
     @app.post('/api/process/<job_id>')
     @api_errors
     def process_video(job_id):
-        directory = store.directory(job_id)
         require_source(job_id)
-        if not (directory / 'active-area-mask.png').is_file():
+        if not store.has_mask(job_id):
             raise ValueError('Generate and approve an active-area preview first.')
-        payload = request.get_json(silent=True) or {}
-        if not isinstance(payload, dict):
-            raise ValueError('Expected an object containing processing options.')
-        debug = payload.get('debug', False)
-        if type(debug) is not bool:
-            raise ValueError('Processing options must be booleans.')
-        return jsonify(runner.submit(job_id, {'generate_debug': debug}))
+        settings = ProcessingSettings.from_request(request.get_json(silent=True) or {})
+        return jsonify(runner.submit(job_id, settings))
 
     @app.get('/api/status/<job_id>')
     @api_errors
@@ -186,7 +175,7 @@ def open_browser(url: str):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run the local Tactical Pan Studio')
+    parser = argparse.ArgumentParser(description='Run the local Auto Pan Frisbee Tracker')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--no-browser', action='store_true')
     parser.add_argument('--jobs-root', type=Path, default=JOBS_ROOT)
@@ -202,14 +191,14 @@ def main():
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise SystemExit('Another Tactical Pan Studio server is using this jobs folder.') from None
+            raise SystemExit('Another Auto Pan Frisbee Tracker server is using this jobs folder.') from None
         app = create_app(arguments.jobs_root, calibration=arguments.calibration)
         runner = app.extensions['job_runner']
         atexit.register(runner.close)
         url = f'http://127.0.0.1:{arguments.port}'
         if not arguments.no_browser:
             threading.Timer(0.8, open_browser, (url,)).start()
-        print(f'Tactical Pan Studio is running at {url}')
+        print(f'Auto Pan Frisbee Tracker is running at {url}')
         try:
             app.run(host='127.0.0.1', port=arguments.port, debug=False, threaded=True)
         finally:

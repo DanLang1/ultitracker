@@ -11,7 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from .events import ProgressEvent
+from . import processor
+from .artifacts import TIMINGS_FILE
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / 'benchmarks' / 'results.jsonl'
@@ -47,27 +48,23 @@ def clock(seconds: float) -> str:
 
 def run_processor(options, output: Path) -> dict:
     """Run the normal command-line processor in a fresh output folder so nothing is reused."""
-    command = [sys.executable, str(ROOT / 'tactical_pan.py'), str(options.input), '--start', str(options.start),
-               '--end', str(options.start + options.duration), '--output-dir', str(output), '--device', options.device]
+    args = [str(options.input), '--start', str(options.start), '--end', str(options.start + options.duration),
+            '--output-dir', str(output), '--device', options.device]
     if options.play_area:
-        command.extend(['--play-area', str(options.play_area)])
-    process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    log, stage, error = [], None, None
-    assert process.stdout is not None
-    for line in process.stdout:
-        log.append(line)
-        event = ProgressEvent.parse(line)
-        if event is None:
-            continue
-        if event.stage == 'error':
-            error = event.message
-        elif event.stage != stage:
-            stage = event.stage
-            print(f'  {time.strftime("%H:%M:%S")} {stage}', flush=True)
-    if process.wait() or error:
+        args.extend(['--play-area', str(options.play_area)])
+    run, log, stage = processor.start(args, cwd=ROOT, supervised=False), [], None
+    try:
+        for event in run.events(on_line=log.append):
+            if event.stage != stage:
+                stage = event.stage
+                print(f'  {time.strftime("%H:%M:%S")} {stage}', flush=True)
+        run.finish()
+    except processor.ProcessorFailed as error:
         sys.stdout.writelines(log[-20:])
-        raise SystemExit(f'Benchmark run failed: {error or f"exit status {process.returncode}"}')
-    return json.loads((output / 'timings.json').read_text())
+        raise SystemExit(f'Benchmark run failed: {error}') from None
+    finally:
+        run.close()
+    return json.loads((output / TIMINGS_FILE).read_text())
 
 
 def record(options, timings: dict) -> dict:

@@ -11,8 +11,6 @@ I've run this on my Macbook and Windows PC via WSL2 with a Nvidia 3080 (so reall
 
 ## Setup
 
-Works on macOS and Linux. On Windows, run it inside [WSL2](https://learn.microsoft.com/windows/wsl/install) (GPU acceleration works there with the normal NVIDIA Windows driver).
-
 1. Install [uv](https://docs.astral.sh/uv/) and FFmpeg (`brew install ffmpeg` on Mac, `sudo apt install ffmpeg` on Ubuntu/WSL).
 2. Install dependencies from the project folder:
 
